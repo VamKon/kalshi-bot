@@ -15,7 +15,7 @@ from utils import fetch
 from sidebar import render_sidebar
 
 st.set_page_config(page_title="Markets", page_icon="🏟️", layout="wide")
-st_autorefresh(interval=60_000, key="markets_refresh")
+st_autorefresh(interval=300_000, key="markets_refresh")  # 5 min — scans run every 12h
 render_sidebar()
 
 st.title("🏟️ Monitored Markets")

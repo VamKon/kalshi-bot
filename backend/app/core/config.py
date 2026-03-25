@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     NEWS_CACHE_TTL_SECONDS: int = 21600   # 6 hours
 
     # ── Sports to monitor ─────────────────────────────────────────────────
-    MONITORED_SPORTS: list[str] = ["NFL", "NBA", "MLS", "Cricket"]
+    MONITORED_SPORTS: list[str] = ["Cricket"]
 
     # ── Market type filter ────────────────────────────────────────────────
     GAME_WINNER_ONLY: bool = True   # only trade game-winner markets (yes/no who wins)
