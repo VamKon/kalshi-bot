@@ -249,7 +249,10 @@ class OddsService:
 
     async def _load_cached(self, db: AsyncSession, sport: str) -> list[dict]:
         """
-        Return all cached sportsbook odds rows for a sport that are within TTL.
+        Return one deduplicated event dict per event_key for a sport, using
+        cached rows within the TTL window.  Reconstructs both home_team,
+        away_team, consensus_home, and consensus_away from stored rows so
+        match_market has everything it needs.
         Returns an empty list if cache is stale or missing.
         """
         now = datetime.now(timezone.utc)
@@ -259,7 +262,7 @@ class OddsService:
             select(SportsbookOdds)
             .where(SportsbookOdds.sport == sport)
             .order_by(desc(SportsbookOdds.fetched_at))
-            .limit(500)
+            .limit(1000)
         )
         rows = result.scalars().all()
 
@@ -267,16 +270,26 @@ class OddsService:
             r for r in rows
             if r.fetched_at and r.fetched_at.timestamp() > cutoff
         ]
-        return [
-            {
-                "event_key":     r.event_key,
-                "home_team":     r.outcome,          # outcome stores home team name
-                "consensus_prob": r.consensus_prob,
-                "implied_prob":  r.implied_prob,
-                "fetched_at":    r.fetched_at,
-            }
-            for r in fresh
-        ]
+
+        # Deduplicate: one entry per event_key, preserving all team/consensus data
+        seen: dict[str, dict] = {}
+        for r in fresh:
+            if r.event_key not in seen:
+                seen[r.event_key] = {
+                    "event_key":      r.event_key,
+                    "home_team":      r.outcome or "",        # outcome = home team
+                    "away_team":      r.away_team or "",      # stored since migration 004
+                    "consensus_home": r.consensus_prob or 0.5,
+                    "consensus_away": r.consensus_away or (1 - (r.consensus_prob or 0.5)),
+                    "bookmaker_count": 0,
+                    "bookmakers":     [],
+                    "min_home_prob":  r.consensus_prob or 0.5,
+                    "max_home_prob":  r.consensus_prob or 0.5,
+                }
+            seen[r.event_key]["bookmaker_count"] += 1
+
+        events = list(seen.values())
+        return events
 
     async def _save_to_cache(
         self,
@@ -285,10 +298,13 @@ class OddsService:
         market_id: str,
         parsed: dict,
     ) -> None:
-        """Upsert consensus odds into the sportsbook_odds cache table."""
+        """Persist consensus odds into the sportsbook_odds cache table.
+
+        Saves one row per bookmaker (for traceability) with both home and
+        away team names so _load_cached can reconstruct full event dicts.
+        """
         now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-        # Persist one row per bookmaker for traceability, plus one consensus row
         for bm in parsed.get("bookmakers", []):
             row = SportsbookOdds(
                 market_id=market_id,
@@ -296,10 +312,12 @@ class OddsService:
                 sport=sport,
                 bookmaker=bm["bookmaker"],
                 market_type="h2h",
-                outcome=parsed["home_team"],
-                price=None,                     # American price not stored separately
+                outcome=parsed["home_team"],           # home team name
+                away_team=parsed.get("away_team", ""), # away team name (migration 004)
+                price=None,
                 implied_prob=bm["home_prob"],
                 consensus_prob=parsed["consensus_home"],
+                consensus_away=parsed.get("consensus_away"),  # away consensus (migration 004)
                 fetched_at=now,
             )
             db.add(row)
@@ -359,25 +377,28 @@ class OddsService:
         Returns None if no matching event is found.
         """
         title = market.get("title", "")
+        ticker = market.get("ticker", "")
+        logger.debug("match_market: checking %d events for [%s] '%s'", len(events), ticker, title)
 
         for event in events:
             home = event.get("home_team", "")
             away = event.get("away_team", "")
+            logger.debug("  candidate event: home='%s' away='%s'", home, away)
+
             if _teams_overlap(title, home, away):
+                # consensus_home is stored under "consensus_home" in live events
+                # and also reconstructed under that key from the cache (_load_cached)
                 consensus_home = event.get("consensus_home", 0.5)
-                consensus_away = event.get("consensus_away", 1 - consensus_home)
+                consensus_away = event.get("consensus_away", round(1 - consensus_home, 4))
 
                 if side == "yes":
-                    # YES typically corresponds to the home/favourite team
-                    # We return the home consensus as a reasonable approximation;
-                    # the AI reasoner should use this directionally.
                     consensus_prob = consensus_home
                     min_prob = event.get("min_home_prob", consensus_home)
                     max_prob = event.get("max_home_prob", consensus_home)
                 else:
                     consensus_prob = consensus_away
-                    min_prob = 1 - event.get("max_home_prob", consensus_home)
-                    max_prob = 1 - event.get("min_home_prob", consensus_home)
+                    min_prob = round(1 - event.get("max_home_prob", consensus_home), 4)
+                    max_prob = round(1 - event.get("min_home_prob", consensus_home), 4)
 
                 return {
                     "consensus_prob":      round(consensus_prob, 4),
@@ -391,6 +412,7 @@ class OddsService:
                     "away_team":           away,
                 }
 
+        logger.debug("match_market: no match found for '%s'", title)
         return None
 
     def describe_movement(self, current_prob: float, prior_prob: Optional[float]) -> str:

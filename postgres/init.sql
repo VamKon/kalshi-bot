@@ -64,10 +64,12 @@ CREATE TABLE IF NOT EXISTS sportsbook_odds (
     sport          VARCHAR(32)   NOT NULL,
     bookmaker      VARCHAR(64)   NOT NULL,
     market_type    VARCHAR(16)   NOT NULL,    -- h2h | spread | total
-    outcome        VARCHAR(128)  NOT NULL,    -- team/side name
+    outcome        VARCHAR(128)  NOT NULL,    -- home team name
+    away_team      VARCHAR(128),              -- away team name
     price          DOUBLE PRECISION,          -- American odds (nullable)
     implied_prob   DOUBLE PRECISION,
-    consensus_prob DOUBLE PRECISION,
+    consensus_prob DOUBLE PRECISION,          -- home consensus probability
+    consensus_away DOUBLE PRECISION,          -- away consensus probability
     fetched_at     TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
 );
 

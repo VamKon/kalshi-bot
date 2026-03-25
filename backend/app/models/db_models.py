@@ -65,8 +65,10 @@ class SportsbookOdds(Base):
     sport: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     bookmaker: Mapped[str] = mapped_column(String(64), nullable=False)
     market_type: Mapped[str] = mapped_column(String(16), nullable=False)   # h2h|spread|total
-    outcome: Mapped[str] = mapped_column(String(128), nullable=False)       # team/side name
+    outcome: Mapped[str] = mapped_column(String(128), nullable=False)       # home team name
+    away_team: Mapped[str | None] = mapped_column(String(128), nullable=True)  # away team name
     price: Mapped[float | None] = mapped_column(Float, nullable=True)       # American odds
     implied_prob: Mapped[float | None] = mapped_column(Float, nullable=True)
     consensus_prob: Mapped[float | None] = mapped_column(Float, nullable=True)
+    consensus_away: Mapped[float | None] = mapped_column(Float, nullable=True)  # away consensus
     fetched_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
