@@ -1,0 +1,320 @@
+"""
+AI Decision Engine — two-stage Claude pipeline to minimise API costs.
+
+Stage 1 (claude-haiku-4-5, ~80% of calls):
+  Quickly scores headlines for sentiment and flags whether the market
+  is interesting enough to warrant a full Sonnet analysis.
+
+Stage 2 (claude-sonnet-4-6, ~20% of calls):
+  Full reasoning over all signals -> structured trade decision.
+
+The static system prompt is sent with cache_control so Anthropic caches
+it across calls, reducing billable input tokens significantly.
+"""
+import asyncio
+import json
+import logging
+from typing import Any
+
+import anthropic
+
+from app.core.config import settings
+from app.models.schemas import AIDecision
+
+logger = logging.getLogger(__name__)
+
+# ── Static system prompt (must stay under 500 tokens) ─────────────────────────
+# Cached by Anthropic — not re-billed after first call.
+SYSTEM_PROMPT = """\
+You are a sports prediction market analyst for Kalshi paper trading.
+Respond ONLY with valid JSON — no markdown, no explanation outside the JSON.
+
+For trade decisions use exactly:
+{"trade": bool, "side": "yes"|"no", "confidence": 0.0-1.0, "reasoning": "one paragraph"}
+
+CORE CONCEPT — VALUE BETTING (read carefully):
+YES price = market-implied probability YES wins. E.g. YES=0.61 means market thinks 61% chance YES wins, 39% chance NO wins.
+Your job: estimate the TRUE probability for each side, then compare to the market price.
+
+Step-by-step decision process:
+1. Estimate P(YES wins) from headlines and matchup context.
+2. Compute P(NO wins) = 1 - P(YES wins).
+3. Edge_YES = P(YES wins) - yes_price.  Edge_NO = P(NO wins) - (1 - yes_price).
+4. Pick the side with the larger positive edge (if any).
+5. If max edge > 0.03: set trade=true, side=that side, confidence=your probability for that side.
+6. If no side has edge > 0.03: set trade=false.
+
+Example: YES=0.61 (market says NZ 61%, SA 39%). You think NZ 48%, SA 52%.
+  Edge_YES = 0.48 - 0.61 = -0.13 (negative, don't bet YES)
+  Edge_NO  = 0.52 - 0.39 = +0.13 (positive! bet NO)
+  → trade=true, side="no", confidence=0.52
+
+DO NOT set trade=false just because confidence is modest (e.g. 0.52).
+A 52% estimate vs a 39% market price is a 13% edge — that IS worth trading.
+Only set trade=false when edge ≤ 0.03 for both sides.
+"""
+
+# ── Stage-1 Haiku prompt ───────────────────────────────────────────────────────
+HAIKU_PROMPT = """\
+Headlines about: {title} ({sport})
+{headlines}
+
+Score the overall news sentiment for this team/matchup on a scale from -1.0 (very negative/underdog) to +1.0 (very positive/favourite).
+Respond ONLY with JSON: {{"sentiment": <-1.0 to 1.0>}}\
+"""
+
+# ── Stage-2 Sonnet prompt (dynamic section only) ──────────────────────────────
+SONNET_USER_PROMPT = """\
+Market: {title} ({sport})
+Type: {market_type} | Hours until game: {hours:.1f}h
+YES price: {yes_price:.2f} | NO price: {no_price:.2f} | Bid-ask spread: {spread:.3f}
+Sentiment: {sentiment:.3f} | Rule signal: {rule_signal:.3f}
+{odds_section}Headlines:
+{headlines}
+"""
+
+# Injected into SONNET_USER_PROMPT when sportsbook odds are available
+ODDS_SECTION_TEMPLATE = """\
+SPORTSBOOK CONSENSUS:
+- Consensus probability: {consensus_prob:.1%}
+- Bookmaker range: {min_prob:.1%} - {max_prob:.1%}
+- Line movement: {movement}
+- Bookmakers ({count}): {bookmaker_summary}
+Your role: does the sportsbook consensus make sense given the headlines/injuries,
+or is there information the line hasn't priced in yet?
+"""
+
+
+def _compute_rule_signal(market: dict) -> float:
+    """
+    Rule-based signal combining:
+    - Public betting bias (fade extreme YES prices)
+    - Volume/liquidity signal
+    - Bid-ask spread penalty (wide spread = less informed market)
+
+    Returns a float in roughly [-0.5, 0.5].
+    """
+    yes_ask = float(market.get("yes_ask_dollars") or 0.5)
+    yes_bid = float(market.get("yes_bid_dollars") or 0.0)
+    volume  = float(market.get("open_interest_fp") or market.get("volume") or 0)
+
+    # Public betting bias — fade heavy public sides
+    bias_signal = -0.4 if yes_ask > 0.80 else (0.2 if yes_ask < 0.40 else 0.0)
+
+    # Volume/liquidity signal — more action = more information
+    vol_signal = min(volume / 10_000, 1.0) * 0.3
+
+    # Spread penalty — wide spread means less informed/liquid market
+    spread = yes_ask - yes_bid
+    spread_penalty = -min(spread / 0.10, 1.0) * 0.15   # up to -0.15 for wide spreads
+
+    return round(bias_signal + vol_signal + spread_penalty, 3)
+
+
+def _hours_until_game(market: dict) -> float:
+    """Best-effort hours until game; returns 24.0 as a safe default."""
+    from datetime import datetime, timezone
+    close_str = market.get("expected_expiration_time") or market.get("close_time")
+    if not close_str:
+        return 24.0
+    try:
+        close_dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+        return max(0.0, (close_dt - datetime.now(timezone.utc)).total_seconds() / 3600)
+    except Exception:
+        return 24.0
+
+
+class AIService:
+
+    def __init__(self) -> None:
+        self._client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+    def _headline_text(self, headlines: list[str]) -> str:
+        if not headlines:
+            return "No recent headlines."
+        return "\n".join(f"- {h}" for h in headlines[:8])
+
+    @staticmethod
+    def _extract_json(raw: str) -> str:
+        """
+        Robustly extract the first complete {...} JSON object from raw text.
+        Handles:
+        - Pure JSON responses
+        - JSON wrapped in markdown code fences (```json ... ```)
+        - JSON embedded in prose (model reasoning before/after the JSON block)
+        """
+        raw = raw.strip()
+
+        # 1. Try markdown code fences first
+        if "```" in raw:
+            for part in raw.split("```"):
+                part = part.lstrip("json").strip()
+                if part.startswith("{"):
+                    return part
+
+        # 2. Find the first { and matching last } to extract the JSON object
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return raw[start:end + 1]
+
+        # 3. Return as-is and let the caller's json.loads() produce a useful error
+        return raw
+
+    async def _call_haiku(self, user: str, max_tokens: int = 96) -> str:
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: self._client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "user", "content": user},
+                ],
+            ),
+        )
+        return response.content[0].text if response.content else ""
+
+    async def _call_sonnet(self, user: str, max_tokens: int = 1024) -> str:
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: self._client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=max_tokens,
+                system=[
+                    {
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[
+                    {"role": "user", "content": user},
+                ],
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+            ),
+        )
+        raw = response.content[0].text if response.content else ""
+        if not raw:
+            logger.warning("Sonnet returned empty content (stop_reason=%s)", response.stop_reason)
+        return raw
+
+    async def quick_filter(
+        self,
+        market: dict,
+        sport: str,
+        headlines: list[str],
+        market_type: str = "other",
+    ) -> tuple[bool, float, str]:
+        """
+        Stage 1 — Haiku (sentiment scoring only).
+        Always returns interesting=True — Haiku no longer makes skip decisions.
+        The rule-based pre-filters already handle all the real gating.
+        Haiku's only job here is to score headline sentiment cheaply.
+        Returns (interesting=True, sentiment, reason="").
+        """
+        headline_text = self._headline_text(headlines)
+        prompt = HAIKU_PROMPT.format(
+            title=market.get("title", "Unknown"),
+            sport=sport,
+            headlines=headline_text,
+        )
+        raw = ""
+        try:
+            raw = await self._call_haiku(prompt, max_tokens=24)
+            data = json.loads(self._extract_json(raw))
+            sentiment = float(data.get("sentiment", 0.0))
+            logger.info(
+                "Haiku [%s] %s — sentiment=%.2f",
+                sport, market.get("ticker", "?"), sentiment,
+            )
+            return True, sentiment, ""
+        except json.JSONDecodeError as exc:
+            logger.warning("Haiku sentiment error: %s — raw: %r — defaulting sentiment=0.0", exc, raw[:100] if raw else "<empty>")
+            return True, 0.0, ""
+        except Exception as exc:
+            logger.warning("Haiku sentiment error: %s — defaulting sentiment=0.0", exc)
+            return True, 0.0, ""
+
+    async def decide(
+        self,
+        market: dict,
+        sport: str,
+        sentiment: float,
+        headlines: list[str],
+        market_type: str = "other",
+        odds_context: dict | None = None,
+    ) -> AIDecision:
+        """
+        Stage 2 — Sonnet.
+        Full trade decision. Only called for markets that passed quick_filter.
+
+        odds_context (optional) — dict from OddsService.match_market() with keys:
+            consensus_prob, min_prob, max_prob, bookmaker_count, bookmakers, movement
+        """
+        yes_ask = float(market.get("yes_ask_dollars") or 0.5)
+        yes_bid = float(market.get("yes_bid_dollars") or 0.0)
+        spread  = round(yes_ask - yes_bid, 4)
+        hours   = _hours_until_game(market)
+        rule_signal = _compute_rule_signal(market)
+
+        # ── Build optional odds section ─────────────────────────────────────
+        odds_section = ""
+        if odds_context and odds_context.get("consensus_prob") is not None:
+            bm_details = odds_context.get("bookmakers", [])
+            bm_summary = ", ".join(
+                f"{b['bookmaker']}:{b.get('home_prob', 0):.1%}"
+                for b in bm_details[:6]   # cap at 6 to stay within token budget
+            ) or "N/A"
+            odds_section = ODDS_SECTION_TEMPLATE.format(
+                consensus_prob=odds_context["consensus_prob"],
+                min_prob=odds_context.get("min_prob", odds_context["consensus_prob"]),
+                max_prob=odds_context.get("max_prob", odds_context["consensus_prob"]),
+                movement=odds_context.get("movement", "No prior reading"),
+                count=odds_context.get("bookmaker_count", len(bm_details)),
+                bookmaker_summary=bm_summary,
+            )
+
+        headline_text = self._headline_text(headlines)
+        logger.info(
+            "Sonnet [%s] %s — headlines: %s",
+            sport, market.get("ticker", "?"), headline_text,
+        )
+        user_prompt = SONNET_USER_PROMPT.format(
+            title=market.get("title", "Unknown"),
+            sport=sport,
+            market_type=market_type,
+            hours=hours,
+            yes_price=yes_ask,
+            no_price=round(1 - yes_ask, 3),
+            spread=spread,
+            sentiment=sentiment,
+            rule_signal=rule_signal,
+            odds_section=odds_section,
+            headlines=headline_text,
+        )
+
+        raw = ""
+        try:
+            raw = await self._call_sonnet(user_prompt)
+            data: dict[str, Any] = json.loads(self._extract_json(raw))
+            return AIDecision(
+                trade=bool(data.get("trade", False)),
+                side=str(data.get("side", "no")),
+                confidence=float(data.get("confidence", 0.0)),
+                reasoning=str(data.get("reasoning", "")),
+            )
+        except json.JSONDecodeError as exc:
+            logger.error("Sonnet returned non-JSON: %s — raw: %r", exc, raw[:200] if raw else "<empty>")
+        except Exception as exc:
+            logger.error("AI decision error: %s", exc, exc_info=True)
+
+        return AIDecision(trade=False, side="no", confidence=0.0,
+                          reasoning="AI service error — defaulting to no-trade.")
+
+    def compute_rule_signal(self, market: dict) -> float:
+        return _compute_rule_signal(market)
+
+
+ai_service = AIService()

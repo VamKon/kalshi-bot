@@ -1,0 +1,16 @@
+# Secrets
+.env
+*.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Dev artifacts
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/

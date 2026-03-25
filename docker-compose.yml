@@ -1,0 +1,74 @@
+version: "3.9"
+
+# ── Local dev / smoke-test stack ──────────────────────────────────────────
+# Usage:
+#   cp .env.example .env          # add ANTHROPIC_API_KEY + KALSHI_KEY_ID + KALSHI_PRIVATE_KEY
+#   docker compose up --build
+
+services:
+
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       kalshi_bot
+      POSTGRES_USER:     kalshi
+      POSTGRES_PASSWORD: kalshi
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kalshi -d kalshi_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    image: vkon2001/kalshi-trading-backend:latest
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL:        postgresql+asyncpg://kalshi:kalshi@postgres:5432/kalshi_bot
+      ANTHROPIC_API_KEY:   ${ANTHROPIC_API_KEY}
+      KALSHI_KEY_ID:       ${KALSHI_KEY_ID:-}
+      KALSHI_PRIVATE_KEY:  ${KALSHI_PRIVATE_KEY:-}
+      NEWS_API_KEY:        ${NEWS_API_KEY:-}
+      PAPER_TRADING:       "true"
+      INITIAL_BANKROLL:    "1000.0"
+      KELLY_FRACTION:      "0.25"
+      MAX_TRADE_PCT:       "0.05"
+      MAX_TRADE_USD:       "50.0"
+      MIN_CONFIDENCE:      "0.55"
+      MIN_EDGE_THRESHOLD:  "0.03"
+      SCAN_INTERVAL_HOURS: "12"
+      DEBUG:               ${DEBUG:-false}
+    ports:
+      - "8000:8000"
+    volumes:
+      # Hot-reload during local dev
+      - ./backend/app:/app/app:ro
+
+  streamlit:
+    image: vkon2001/kalshi-trading-streamlit:latest
+    build:
+      context: ./streamlit_app
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./streamlit_app:/app:ro
+
+volumes:
+  pg_data:
