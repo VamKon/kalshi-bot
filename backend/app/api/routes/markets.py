@@ -61,23 +61,30 @@ async def list_markets(sport: str | None = None, db: AsyncSession = Depends(get_
         bookmaker_count = None
         line_movement   = None
 
+        ai_recommendation = None
         if sig:
             try:
-                consensus_prob  = sig.consensus_prob
-                bookmaker_count = sig.bookmaker_count
-                line_movement   = sig.line_movement
+                consensus_prob    = sig.consensus_prob
+                bookmaker_count   = sig.bookmaker_count
+                line_movement     = sig.line_movement
+                ai_recommendation = sig.ai_recommendation
             except Exception:
                 pass  # columns not yet migrated — safe to ignore
 
         if consensus_prob is not None and yes_ask is not None:
             edge_pct = round(consensus_prob - yes_ask, 4)
 
+        # Prefer expected_expiration_time (game end) over close_time (backstop deadline)
+        game_time_str = m.get("expected_expiration_time") or m.get("close_time")
+
         markets.append(MarketInfo(
             ticker=m.get("ticker", ""), title=m.get("title", ""),
             sport=detected_sport, status=m.get("status", "open"),
             yes_bid=round(yes_bid, 3), yes_ask=round(yes_ask, 3),
             volume=m.get("volume"), close_time=m.get("close_time"),
+            game_time=game_time_str,
             signal_strength=signal_strength,
+            ai_recommendation=ai_recommendation,
             consensus_prob=consensus_prob,
             edge_pct=edge_pct,
             line_movement=line_movement,

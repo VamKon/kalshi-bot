@@ -63,11 +63,18 @@ with st.form("settings_form"):
         value=float(current.get("kelly_fraction", 0.25)),
         help="Multiplier applied to full Kelly size. 0.25 = quarter Kelly (recommended).",
     )
-    max_trade = st.number_input(
-        "Max Trade Size ($)",
-        min_value=1.0, max_value=500.0, step=1.0,
-        value=float(current.get("max_trade_usd", 50.0)),
-        help="Hard dollar cap per trade regardless of Kelly output.",
+    sz_col1, sz_col2 = st.columns(2)
+    max_trade = sz_col1.number_input(
+        "Max Stake per Trade ($)",
+        min_value=1.0, max_value=10_000.0, step=1.0,
+        value=float(current.get("max_trade_usd", 11.0)),
+        help="Hard dollar cap per trade. Kelly output is clipped to this value.",
+    )
+    max_trade_pct = sz_col2.number_input(
+        "Max Stake (% of bankroll)",
+        min_value=1, max_value=100, step=1,
+        value=int(round(float(current.get("max_trade_pct", 0.10)) * 100)),
+        help="Hard percentage cap per trade. The lower of this and Max Stake ($) wins.",
     )
 
     st.subheader("AI Decision Threshold")
@@ -90,6 +97,7 @@ if submitted:
                 "scan_interval_hours": scan_hours,
                 "kelly_fraction": kelly,
                 "max_trade_usd": max_trade,
+                "max_trade_pct": max_trade_pct / 100.0,
                 "min_confidence": min_conf,
                 "monitored_sports": selected_sports,
                 "game_winner_only": game_winner_only,
@@ -108,17 +116,27 @@ st.subheader("💰 Portfolio Balance")
 
 portfolio = fetch("/portfolio")
 if portfolio:
-    balance       = portfolio.get("balance", 0.0)
-
-    # Sum of stakes across all open trades
-    open_trades   = fetch("/trades", params={"status": "open", "limit": 500})
-    deployed      = sum(t.get("stake", 0) for t in (open_trades or []))
-    available     = max(0.0, balance - deployed)
+    # Backend pre-computes best available values from Kalshi + DB
+    display_total     = portfolio.get("kalshi_portfolio") or portfolio.get("balance", 0.0)
+    display_available = portfolio.get("available_cash", 0.0)
+    deployed          = portfolio.get("deployed", 0.0)
 
     bc1, bc2, bc3 = st.columns(3)
-    bc1.metric("Total Balance",     f"${balance:,.2f}",   help="Current portfolio balance")
-    bc2.metric("Deployed in Trades", f"${deployed:,.2f}",  help="Sum of stakes on all open trades")
-    bc3.metric("Available Cash",     f"${available:,.2f}", help="Balance minus deployed stakes")
+    bc1.metric(
+        "Portfolio Value",
+        f"${display_total:,.2f}",
+        help="Live total from Kalshi (cash + open position value). Falls back to DB if Kalshi unreachable.",
+    )
+    bc2.metric(
+        "Deployed in Trades",
+        f"${deployed:,.2f}",
+        help="Sum of stakes currently locked in open trades (from DB)",
+    )
+    bc3.metric(
+        "Available Cash",
+        f"${display_available:,.2f}",
+        help="Live cash balance from Kalshi — ready to place new trades.",
+    )
 
     st.markdown("**Adjust Balance**")
     st.caption(
@@ -130,14 +148,14 @@ if portfolio:
     new_balance = adj_col1.number_input(
         "New Balance ($)",
         min_value=0.01, max_value=1_000_000.0, step=10.0,
-        value=round(balance, 2),
+        value=round(display_total, 2),
         format="%.2f",
         help="Enter the new total portfolio balance and click Update.",
     )
     update_clicked = adj_col2.button("💾 Update Balance", use_container_width=True)
 
     if update_clicked:
-        if abs(new_balance - balance) < 0.01:
+        if abs(new_balance - display_total) < 0.01:
             st.info("Balance unchanged.")
         else:
             result = put("/portfolio/balance", json={"balance": new_balance})
@@ -203,9 +221,51 @@ with col2:
 
 st.divider()
 
-# ── Read-only info ─────────────────────────────────────────────────────────
-st.subheader("Current Configuration (read-only)")
-col1, col2 = st.columns(2)
-col1.json({k: v for k, v in current.items() if k not in (
-    "scan_interval_hours", "kelly_fraction", "max_trade_usd", "min_confidence"
-)})
+# ── Current live configuration (read-only summary) ─────────────────────────
+st.subheader("📋 Active Configuration")
+st.caption("What the bot is currently running with. Edit above and save to change.")
+
+cfg1, cfg2, cfg3, cfg4, cfg5, cfg6 = st.columns(6)
+cfg1.metric(
+    "Scan Interval",
+    f"{current.get('scan_interval_hours', '?')}h",
+    help="How often the bot scans for opportunities",
+)
+cfg2.metric(
+    "Kelly Fraction",
+    f"{float(current.get('kelly_fraction', 0.25)):.0%}",
+    help="Fraction of full Kelly bet size applied to each trade",
+)
+cfg3.metric(
+    "Max Stake",
+    f"${float(current.get('max_trade_usd', 11)):.0f}  /  {float(current.get('max_trade_pct', 0.10)):.0%}",
+    help="Hard cap per trade: lower of the $ amount and the % of bankroll wins",
+)
+cfg4.metric(
+    "Min Confidence",
+    f"{float(current.get('min_confidence', 0.50)):.0%}",
+    help="Minimum AI confidence required to place a trade",
+)
+cfg5.metric(
+    "Min Edge",
+    f"{float(current.get('min_edge_threshold', 0.02)):.0%}",
+    help="Minimum edge (consensus prob − Kalshi price) required to trade",
+)
+cfg6.metric(
+    "Mode",
+    "📄 Paper" if current.get("paper_trading", True) else "💸 Live",
+    help="Whether the bot places real money trades or simulates them",
+)
+
+st.markdown("")
+market_type_label = "Game-winner only" if current.get("game_winner_only", True) else "All market types"
+sports_list       = ", ".join(current.get("monitored_sports", [])) or "none"
+kalshi_url_label  = current.get("kalshi_api_base_url", "—")
+
+info_col1, info_col2 = st.columns(2)
+info_col1.info(f"**Sports:** {sports_list}  \n**Market filter:** {market_type_label}")
+info_col2.info(
+    f"**Kalshi API:** `{kalshi_url_label}`  \n"
+    f"**Max bid-ask spread:** {float(current.get('max_bid_ask_spread', 0.04)):.0%}  ·  "
+    f"**Min volume:** {int(float(current.get('min_market_volume', 100)))}"
+)

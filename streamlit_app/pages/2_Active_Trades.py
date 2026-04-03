@@ -5,12 +5,31 @@ Table of open positions with unrealised P&L estimate.
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from datetime import datetime, timezone
+
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from utils import fetch, fmt_usd
 from sidebar import render_sidebar
+
+
+def _hours_until(iso_str) -> str:
+    if not iso_str or pd.isna(iso_str):
+        return "—"
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = int((dt - datetime.now(timezone.utc)).total_seconds())
+        if delta <= 0:
+            return "⏰ now"
+        h, rem = divmod(delta, 3600)
+        m = rem // 60
+        return f"{h}h {m}m" if h > 0 else f"{m}m"
+    except Exception:
+        return "—"
 
 st.set_page_config(page_title="Active Trades", page_icon="📋", layout="wide")
 st_autorefresh(interval=60_000, key="active_refresh")
@@ -25,6 +44,14 @@ if not trades:
     st.stop()
 
 df = pd.DataFrame(trades)
+
+# Build a game_time lookup from the markets endpoint (best-effort, no error if unavailable)
+markets_data = fetch("/markets") or []
+game_time_by_ticker: dict[str, str] = {
+    m["ticker"]: m.get("game_time") or ""
+    for m in markets_data
+    if m.get("ticker")
+}
 
 
 def kalshi_url(ticker: str) -> str:
@@ -57,6 +84,16 @@ if "confidence" in df_display.columns:
     )
 if "created_at" in df_display.columns:
     df_display["created_at"] = pd.to_datetime(df_display["created_at"]).dt.strftime("%b %d %H:%M")
+# Resolves in — look up game_time from markets, fall back to "—"
+if "market_id" in df_display.columns:
+    df_display["resolves_in"] = df_display["market_id"].map(
+        lambda tid: _hours_until(game_time_by_ticker.get(tid, ""))
+    )
+# Color-coded YES/NO badge
+if "side" in df_display.columns:
+    df_display["side"] = df_display["side"].apply(
+        lambda s: "🟢 YES" if str(s).lower() == "yes" else "🔴 NO"
+    )
 
 df_display = df_display.rename(columns={
     "id":           "ID",
@@ -68,6 +105,7 @@ df_display = df_display.rename(columns={
     "entry_price":  "Entry Price",
     "confidence":   "AI Conf (%)",
     "created_at":   "Opened At",
+    "resolves_in":  "Resolves In",
     "kalshi_link":  "Kalshi",
 })
 
@@ -90,6 +128,10 @@ col_config = {
     "Entry Price": st.column_config.NumberColumn(
         "Entry Price",
         format="%.3f",
+    ),
+    "Resolves In": st.column_config.TextColumn(
+        "Resolves In",
+        help="Estimated time until game ends and Kalshi settles the market",
     ),
 }
 

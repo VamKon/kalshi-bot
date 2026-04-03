@@ -1,10 +1,11 @@
 """
 Shared sidebar renderer — call render_sidebar() at the top of every page.
 
-Shows live portfolio stats, bot status indicator, and last-refresh time.
+Shows live portfolio stats, bot status indicator, next-scan countdown,
+and last-refresh time.
 Uses the same cached fetch() so it adds zero extra API calls.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 
 import streamlit as st
 
@@ -12,6 +13,30 @@ import sys, os
 # sidebar.py lives in streamlit_app/ — utils.py is in the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import fetch, fmt_usd
+
+
+def _next_scan_label(last_scan_iso: str | None, interval_hours: float) -> str:
+    """Return a human-readable 'Next scan in Xh Ym' string, or 'soon'."""
+    if not last_scan_iso:
+        return "unknown"
+    try:
+        last = datetime.fromisoformat(last_scan_iso)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        from datetime import timedelta
+        next_scan = last + timedelta(hours=interval_hours)
+        delta = next_scan - now
+        total_secs = int(delta.total_seconds())
+        if total_secs <= 0:
+            return "soon"
+        h, rem = divmod(total_secs, 3600)
+        m = rem // 60
+        if h > 0:
+            return f"{h}h {m}m"
+        return f"{m}m"
+    except Exception:
+        return "unknown"
 
 
 def render_sidebar() -> None:
@@ -31,10 +56,16 @@ def render_sidebar() -> None:
             unsafe_allow_html=True,
         )
 
-        # ── Bot status ─────────────────────────────────────────────────────
+        # ── Bot status + next scan countdown ───────────────────────────────
         health = fetch("/health")
         if health:
             st.success("🟢  Bot Online", icon=None)
+            last_scan = health.get("last_scan_at")
+            interval  = float(health.get("scan_interval_hours", 2))
+            next_in   = _next_scan_label(last_scan, interval)
+            paper     = health.get("paper_trading", False)
+            mode_badge = "📄 Paper" if paper else "💸 Live"
+            st.caption(f"{mode_badge}  ·  Next scan in **{next_in}**")
         else:
             st.error("🔴  Bot Offline")
 
@@ -45,13 +76,16 @@ def render_sidebar() -> None:
         if portfolio:
             st.markdown("**Portfolio**")
 
-            balance        = portfolio.get("balance", 0)
-            deployed       = portfolio.get("deployed", 0)
-            available_cash = portfolio.get("available_cash", balance)
-            pnl            = portfolio.get("total_pnl", 0)
-            win_rate       = portfolio.get("win_rate_pct", 0)
-            roi            = portfolio.get("roi_pct", 0)
-            active         = portfolio.get("active_trades", 0)
+            # Backend pre-computes best available values from Kalshi + DB
+            display_balance   = portfolio.get("kalshi_portfolio") or portfolio.get("balance", 0)
+            display_available = portfolio.get("available_cash", 0)
+            deployed          = portfolio.get("deployed", 0)
+            live_indicator    = "" if portfolio.get("kalshi_balance") is not None else " 🔴"
+
+            pnl      = portfolio.get("total_pnl", 0)
+            win_rate = portfolio.get("win_rate_pct", 0)
+            roi      = portfolio.get("roi_pct", 0)
+            active   = portfolio.get("active_trades", 0)
 
             pnl_sign  = "+" if pnl >= 0 else ""
             pnl_color = "#00d4aa" if pnl >= 0 else "#ff4b4b"
@@ -64,8 +98,8 @@ def render_sidebar() -> None:
                     margin-bottom:8px; line-height:1.8;
                 ">
                   <div style="display:flex;justify-content:space-between;">
-                    <span style="color:#888;font-size:.8rem;">Balance</span>
-                    <span style="font-weight:600;">${balance:,.2f}</span>
+                    <span style="color:#888;font-size:.8rem;">Portfolio Value{live_indicator}</span>
+                    <span style="font-weight:600;">${display_balance:,.2f}</span>
                   </div>
                   <div style="display:flex;justify-content:space-between;">
                     <span style="color:#888;font-size:.8rem;">Deployed</span>
@@ -73,7 +107,7 @@ def render_sidebar() -> None:
                   </div>
                   <div style="display:flex;justify-content:space-between;">
                     <span style="color:#888;font-size:.8rem;">Available Cash</span>
-                    <span style="font-weight:600;color:#00d4aa;">${available_cash:,.2f}</span>
+                    <span style="font-weight:600;color:#00d4aa;">${display_available:,.2f}</span>
                   </div>
                   <div style="display:flex;justify-content:space-between;">
                     <span style="color:#888;font-size:.8rem;">Total P&L</span>

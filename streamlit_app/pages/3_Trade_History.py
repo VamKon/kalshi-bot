@@ -87,6 +87,11 @@ if "confidence" in display.columns:
     )
 if "resolved_at" in display.columns:
     display["resolved_at"] = pd.to_datetime(display["resolved_at"]).dt.strftime("%b %d %H:%M")
+# Color-coded YES/NO badge
+if "side" in display.columns:
+    display["side"] = display["side"].apply(
+        lambda s: "🟢 YES" if str(s).lower() == "yes" else "🔴 NO"
+    )
 
 display = display.rename(columns={
     "id":           "ID",

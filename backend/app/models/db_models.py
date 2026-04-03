@@ -49,6 +49,8 @@ class MarketSignal(Base):
     consensus_prob: Mapped[float | None] = mapped_column(Float, nullable=True)
     bookmaker_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     line_movement: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Kalshi YES ask at scan time — used to detect price movement between scans
+    yes_ask: Mapped[float | None] = mapped_column(Float, nullable=True)
     scanned_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 

@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     MAX_TRADE_PCT: float = 0.05               # 5% of available cash per trade
     MAX_TRADE_USD: float = 50.0               # hard-cap per trade in dollars
     MIN_CONFIDENCE: float = 0.50             # AI confidence threshold
-    MIN_EDGE_THRESHOLD: float = 0.03          # minimum 3% edge to trade
+    MIN_EDGE_THRESHOLD: float = 0.02          # minimum 2% edge to trade
 
     # ── Scheduler ─────────────────────────────────────────────────────────
     SCAN_INTERVAL_HOURS: int = 12
@@ -51,8 +51,8 @@ class Settings(BaseSettings):
     MARKET_PROB_MAX: float = 0.90         # skip near-certain YES (> 90%)
     MARKET_HOURS_AHEAD: int = 48          # only trade games within 48 h
     MARKET_MIN_HOURS_AHEAD: float = 1.5   # skip games starting within 1.5 h
-    MIN_MARKET_VOLUME: float = 0.0        # DEMO: set to 100.0 for production
-    MAX_BID_ASK_SPREAD: float = 0.06      # skip illiquid markets (spread > 6%)
+    MIN_MARKET_VOLUME: float = 100.0      # require meaningful open interest for live trading
+    MAX_BID_ASK_SPREAD: float = 0.04      # skip illiquid markets (spread > 4%)
 
     # ── News cache ────────────────────────────────────────────────────────
     NEWS_CACHE_TTL_SECONDS: int = 21600   # 6 hours
@@ -62,6 +62,13 @@ class Settings(BaseSettings):
 
     # ── Market type filter ────────────────────────────────────────────────
     GAME_WINNER_ONLY: bool = True   # only trade game-winner markets (yes/no who wins)
+
+    # ── Sportsbook coverage requirement ───────────────────────────────────
+    # When True, skip any market where The Odds API finds no matching bookmaker
+    # lines. This automatically blocks obscure markets (minnow cricket nations,
+    # international friendlies, etc.) without needing a manual blocklist.
+    # Falls back to AI-only edge when False (less reliable but more coverage).
+    REQUIRE_SPORTSBOOK_ODDS: bool = True
 
     class Config:
         env_file = ".env"

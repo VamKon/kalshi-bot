@@ -43,7 +43,7 @@ def kelly_stake(available_cash: float, probability: float, odds: float,
         return 0.0
     # Size against available cash only
     raw_stake = f_star * kelly_fraction * available_cash
-    if raw_stake < 0.50:
+    if raw_stake < 0.10:
         return 0.0
     stake = min(raw_stake,
                 available_cash * settings.MAX_TRADE_PCT,
@@ -90,6 +90,51 @@ async def get_available_cash(db: AsyncSession) -> float:
     portfolio = await get_or_create_portfolio(db)
     deployed = await get_deployed_stake(db)
     return max(0.0, portfolio.balance - deployed)
+
+
+async def sync_balance_from_kalshi(db: AsyncSession) -> Optional[float]:
+    """
+    Pull the live total portfolio value from Kalshi and update the DB record.
+
+    We sync from `portfolio_value` (cash + open-position market value), NOT
+    from `balance` (cash only).  The DB portfolio.balance represents the
+    *total* funds — deployed stakes are then subtracted to get available cash.
+    Syncing to cash-only would cause double-subtraction:
+        available_cash = cash_only_balance − deployed  →  too low
+
+    Only writes to DB when drift > $0.05 to avoid spurious commits from
+    rounding noise on unsettled contracts.
+
+    Returns the synced total value, or None if Kalshi was unreachable.
+    """
+    from app.services.kalshi_client import kalshi_client  # avoid circular import
+
+    kalshi_data = await kalshi_client.get_balance()
+    # Prefer portfolio_value (total); fall back to cash balance if unavailable
+    live_total = kalshi_data.get("portfolio_value") or kalshi_data.get("balance")
+
+    if live_total is None:
+        logger.warning("sync_balance_from_kalshi: Kalshi balance unavailable, keeping DB value")
+        return None
+
+    portfolio = await get_or_create_portfolio(db)
+    diff = abs(live_total - portfolio.balance)
+
+    if diff > 0.05:
+        logger.info(
+            "Syncing balance from Kalshi: DB=$%.2f → Kalshi portfolio_value=$%.2f (diff=$%.2f)",
+            portfolio.balance, live_total, diff,
+        )
+        portfolio.balance = round(live_total, 2)
+        portfolio.updated_at = datetime.utcnow()
+        await db.commit()
+    else:
+        logger.debug(
+            "Balance in sync: DB=$%.2f, Kalshi=$%.2f (diff=$%.4f — no update needed)",
+            portfolio.balance, live_total, diff,
+        )
+
+    return live_total
 
 
 async def update_balance(db: AsyncSession, delta: float) -> None:
@@ -281,13 +326,15 @@ class TradingService:
                           ai_recommendation: str,
                           consensus_prob: Optional[float] = None,
                           bookmaker_count: Optional[int] = None,
-                          line_movement: Optional[str] = None) -> None:
+                          line_movement: Optional[str] = None,
+                          yes_ask: Optional[float] = None) -> None:
         signal = MarketSignal(market_id=market_id, sport=sport,
                               news_sentiment=sentiment, rule_signal=rule_signal,
                               ai_recommendation=ai_recommendation,
                               consensus_prob=consensus_prob,
                               bookmaker_count=bookmaker_count,
-                              line_movement=line_movement)
+                              line_movement=line_movement,
+                              yes_ask=yes_ask)
         db.add(signal)
         await db.commit()
 

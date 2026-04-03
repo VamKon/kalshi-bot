@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import health, markets, portfolio, resolve, scan, trades, settings_route
+from app.core.alerts import install_log_handler
 from app.core.config import settings
 from app.core.database import engine, Base
 from app.schedulers.market_scan import start_scheduler, stop_scheduler
@@ -16,6 +17,8 @@ logging.basicConfig(
     level=logging.DEBUG if settings.DEBUG else logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s — %(message)s",
 )
+# Install alert handler AFTER basicConfig so it attaches to the root logger
+install_log_handler()
 logger = logging.getLogger(__name__)
 
 

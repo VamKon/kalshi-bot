@@ -352,6 +352,33 @@ class KalshiClient:
             logger.error("Kalshi order failed: %s", exc)
             return None
 
+    # ── Account balance ───────────────────────────────────────────────────────
+
+    async def get_balance(self) -> dict:
+        """
+        Fetch the current balance from Kalshi's /portfolio/balance endpoint.
+
+        Returns a dict with:
+          - balance:         available cash in dollars (ready to trade)
+          - portfolio_value: cash + current market value of all open positions
+
+        Both values are None if the API call fails.
+        Kalshi returns values in cents; we divide by 100.
+        """
+        result = {"balance": None, "portfolio_value": None}
+        try:
+            data = await self._get("/portfolio/balance")
+            logger.debug("Kalshi /portfolio/balance raw response: %s", data)
+            if "balance" in data:
+                result["balance"] = int(data["balance"]) / 100.0
+            if "portfolio_value" in data:
+                result["portfolio_value"] = int(data["portfolio_value"]) / 100.0
+            if result["balance"] is None:
+                logger.warning("Kalshi /portfolio/balance: unexpected response shape: %s", data)
+        except Exception as exc:
+            logger.warning("Failed to fetch Kalshi balance: %s", exc)
+        return result
+
     # ── Classification helpers ─────────────────────────────────────────────
 
     def classify_sport(self, market: dict) -> Optional[str]:

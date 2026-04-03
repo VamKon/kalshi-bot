@@ -31,28 +31,101 @@ if not portfolio:
     st.warning("Portfolio data unavailable.")
     st.stop()
 
+# ── Bot narrative blurb ──────────────────────────────────────────────────────
+from datetime import datetime, timezone, timedelta
+
+def _time_ago(iso_str: str | None) -> str:
+    if not iso_str:
+        return "never"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        secs = int((datetime.now(timezone.utc) - dt).total_seconds())
+        if secs < 60:
+            return "just now"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        return f"{secs // 3600}h {(secs % 3600) // 60}m ago"
+    except Exception:
+        return "unknown"
+
+last_scan_iso   = health.get("last_scan_at")
+scan_interval   = float(health.get("scan_interval_hours", 2))
+monitored       = health.get("monitored_sports", [])
+paper_trading   = health.get("paper_trading", True)
+active_count    = portfolio.get("active_trades", 0)
+last_scan_label = _time_ago(last_scan_iso)
+
+# Next scan countdown
+next_in_label = "unknown"
+if last_scan_iso:
+    try:
+        last_dt   = datetime.fromisoformat(last_scan_iso)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        next_dt   = last_dt + timedelta(hours=scan_interval)
+        delta     = int((next_dt - datetime.now(timezone.utc)).total_seconds())
+        if delta <= 0:
+            next_in_label = "any moment"
+        else:
+            h, rem = divmod(delta, 3600)
+            m = rem // 60
+            next_in_label = f"{h}h {m}m" if h > 0 else f"{m}m"
+    except Exception:
+        pass
+
+sports_str   = ", ".join(monitored) if monitored else "no sports selected"
+mode_str     = "📄 paper trading" if paper_trading else "💸 live trading"
+position_str = (
+    f"**{active_count} open position{'s' if active_count != 1 else ''}**"
+    if active_count > 0 else "**no open positions**"
+)
+
+st.info(
+    f"Monitoring **{sports_str}** · {mode_str} · {position_str} · "
+    f"Last scan: **{last_scan_label}** · Next scan in: **{next_in_label}**"
+)
+
 # ── KPI cards ───────────────────────────────────────────────────────────────
-balance        = portfolio.get("balance", 0)
-deployed       = portfolio.get("deployed", 0)
-available_cash = portfolio.get("available_cash", balance)
-pnl            = portfolio.get("total_pnl", 0)
-win_rate       = portfolio.get("win_rate_pct", 0)
-roi            = portfolio.get("roi_pct", 0)
-active         = portfolio.get("active_trades", 0)
+balance          = portfolio.get("balance", 0)
+kalshi_balance   = portfolio.get("kalshi_balance")   # live cash from Kalshi, may be None
+kalshi_portfolio = portfolio.get("kalshi_portfolio")  # cash + positions, may be None
+deployed         = portfolio.get("deployed", 0)
+available_cash   = portfolio.get("available_cash", balance)
+pnl              = portfolio.get("total_pnl", 0)
+win_rate         = portfolio.get("win_rate_pct", 0)
+roi              = portfolio.get("roi_pct", 0)
+active           = portfolio.get("active_trades", 0)
 
 # Row 1: capital breakdown (4 columns)
 r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-r1c1.metric(
-    "💰 Total Balance", f"${balance:,.2f}",
-    help="Current portfolio balance (cash on hand after deducting open stakes)",
-)
-r1c2.metric(
-    "📤 Deployed", f"${deployed:,.2f}",
-    help="Sum of stakes currently locked in open trades",
-)
+
+if kalshi_balance is not None:
+    r1c1.metric(
+        "💰 Kalshi Cash", f"${kalshi_balance:,.2f}",
+        help="Live available cash from Kalshi API — ready to place new trades.",
+    )
+else:
+    r1c1.metric(
+        "💰 Cash (DB)", f"${balance:,.2f}",
+        help="Bot's internal DB balance (Kalshi API unavailable).",
+    )
+
+if kalshi_portfolio is not None:
+    r1c2.metric(
+        "📊 Portfolio Value", f"${kalshi_portfolio:,.2f}",
+        help="Cash + current market value of all open positions, from Kalshi API.",
+    )
+else:
+    r1c2.metric(
+        "📤 Deployed", f"${deployed:,.2f}",
+        help="Sum of stakes currently locked in open trades (DB estimate).",
+    )
+
 r1c3.metric(
     "💵 Available Cash", f"${available_cash:,.2f}",
-    help="Capital free to place new trades (balance minus deployed)",
+    help="Capital free to place new trades (DB balance minus deployed stakes)",
 )
 r1c4.metric(
     "🔄 Open Trades", active,
@@ -75,7 +148,7 @@ r2c2.metric(
 r2c3.metric(
     "📉 ROI", f"{roi:.1f}%",
     delta=f"{roi:.1f}%", delta_color="normal",
-    help="Return on initial $1,000 bankroll",
+    help="Return on initial bankroll",
 )
 
 st.divider()

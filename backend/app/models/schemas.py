@@ -55,7 +55,9 @@ class MarketInfo(BaseModel):
     yes_ask: Optional[float] = None
     volume: Optional[float] = None
     close_time: Optional[datetime] = None
+    game_time: Optional[datetime] = None        # expected_expiration_time (when game resolves)
     signal_strength: Optional[float] = None
+    ai_recommendation: Optional[str] = None    # Sonnet reasoning from last scan
     # Sportsbook odds fields (populated when ODDS_API_KEY is set)
     consensus_prob: Optional[float] = None      # vig-removed sportsbook consensus
     edge_pct: Optional[float] = None            # consensus_prob - kalshi_yes_ask

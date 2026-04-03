@@ -41,8 +41,8 @@ Step-by-step decision process:
 2. Compute P(NO wins) = 1 - P(YES wins).
 3. Edge_YES = P(YES wins) - yes_price.  Edge_NO = P(NO wins) - (1 - yes_price).
 4. Pick the side with the larger positive edge (if any).
-5. If max edge > 0.03: set trade=true, side=that side, confidence=your probability for that side.
-6. If no side has edge > 0.03: set trade=false.
+5. If max edge > 0.02: set trade=true, side=that side, confidence=your probability for that side.
+6. If no side has edge > 0.02: set trade=false.
 
 Example: YES=0.61 (market says NZ 61%, SA 39%). You think NZ 48%, SA 52%.
   Edge_YES = 0.48 - 0.61 = -0.13 (negative, don't bet YES)
@@ -51,7 +51,7 @@ Example: YES=0.61 (market says NZ 61%, SA 39%). You think NZ 48%, SA 52%.
 
 DO NOT set trade=false just because confidence is modest (e.g. 0.52).
 A 52% estimate vs a 39% market price is a 13% edge — that IS worth trading.
-Only set trade=false when edge ≤ 0.03 for both sides.
+Only set trade=false when edge ≤ 0.02 for both sides.
 """
 
 # ── Stage-1 Haiku prompt ───────────────────────────────────────────────────────
@@ -69,8 +69,54 @@ Market: {title} ({sport})
 Type: {market_type} | Hours until game: {hours:.1f}h
 YES price: {yes_price:.2f} | NO price: {no_price:.2f} | Bid-ask spread: {spread:.3f}
 Sentiment: {sentiment:.3f} | Rule signal: {rule_signal:.3f}
-{odds_section}Headlines:
+{price_movement_section}{sport_context}{odds_section}Headlines:
 {headlines}
+"""
+
+# Injected when we have a previous YES ask price to compare against.
+# A large drop in YES price = smart money on NO; a large rise = smart money on YES.
+PRICE_MOVEMENT_TEMPLATE = """\
+KALSHI PRICE MOVEMENT (since last scan ~{hours_ago:.0f}h ago):
+- Previous YES price: {prev_price:.3f} → Current: {curr_price:.3f} ({direction} {delta_abs:.3f})
+- Interpretation: {interpretation}
+"""
+
+
+def _price_movement_section(prev_yes_ask: float | None, curr_yes_ask: float,
+                             hours_ago: float) -> str:
+    """Build the price movement block for the Sonnet prompt."""
+    if prev_yes_ask is None:
+        return ""
+    delta = round(curr_yes_ask - prev_yes_ask, 4)
+    if abs(delta) < 0.01:          # < 1 cent move — not worth mentioning
+        return ""
+    direction = "▲ up" if delta > 0 else "▼ down"
+    if delta <= -0.05:
+        interp = "significant smart money on NO — market strongly repricing away from YES"
+    elif delta <= -0.02:
+        interp = "moderate selling pressure on YES — worth noting"
+    elif delta >= 0.05:
+        interp = "significant smart money on YES — market repricing toward YES"
+    elif delta >= 0.02:
+        interp = "moderate buying pressure on YES — worth noting"
+    else:
+        interp = "small drift — may be noise"
+    return PRICE_MOVEMENT_TEMPLATE.format(
+        hours_ago=hours_ago,
+        prev_price=prev_yes_ask,
+        curr_price=curr_yes_ask,
+        direction=direction,
+        delta_abs=abs(delta),
+        interpretation=interp,
+    )
+
+# Injected for cricket markets to guide sport-specific reasoning
+CRICKET_CONTEXT = """\
+CRICKET SIGNALS TO PRIORITISE (if present in headlines):
+- Toss result: toss winner elects to bat/bowl — in T20 this shifts win prob ~5-8%. Weight heavily.
+- Playing XI / squad: key player absent (star batter or lead bowler) materially changes probability.
+- Pitch/venue: batting-friendly pitches favour the chasing team; bowler-friendly pitches favour the side batting first.
+- Rain: any rain forecast or wet outfield sharply reduces the favourite's edge.
 """
 
 # Injected into SONNET_USER_PROMPT when sportsbook odds are available
@@ -152,11 +198,33 @@ class AIService:
                 if part.startswith("{"):
                     return part
 
-        # 2. Find the first { and matching last } to extract the JSON object
+        # 2. Find the first { and its matching } using brace-depth counting.
+        # rfind("}")  is wrong when Claude appends extra text after the JSON —
+        # it would include that text, producing two concatenated objects that
+        # json.loads rejects with "Extra data".
         start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return raw[start:end + 1]
+        if start != -1:
+            depth = 0
+            in_string = False
+            escape_next = False
+            for i, ch in enumerate(raw[start:], start):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == "\\" and in_string:
+                    escape_next = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return raw[start:i + 1]
 
         # 3. Return as-is and let the caller's json.loads() produce a useful error
         return raw
@@ -245,6 +313,8 @@ class AIService:
         headlines: list[str],
         market_type: str = "other",
         odds_context: dict | None = None,
+        prev_yes_ask: float | None = None,
+        prev_scan_hours_ago: float = 2.0,
     ) -> AIDecision:
         """
         Stage 2 — Sonnet.
@@ -281,6 +351,14 @@ class AIService:
             "Sonnet [%s] %s — headlines: %s",
             sport, market.get("ticker", "?"), headline_text,
         )
+        sport_context = CRICKET_CONTEXT if sport == "Cricket" else ""
+        price_mv_section = _price_movement_section(prev_yes_ask, yes_ask, prev_scan_hours_ago)
+        if price_mv_section:
+            logger.info(
+                "Price movement [%s] %s: %.3f → %.3f (Δ%.3f)",
+                sport, market.get("ticker", "?"),
+                prev_yes_ask, yes_ask, yes_ask - prev_yes_ask,
+            )
         user_prompt = SONNET_USER_PROMPT.format(
             title=market.get("title", "Unknown"),
             sport=sport,
@@ -291,6 +369,8 @@ class AIService:
             spread=spread,
             sentiment=sentiment,
             rule_signal=rule_signal,
+            price_movement_section=price_mv_section,
+            sport_context=sport_context,
             odds_section=odds_section,
             headlines=headline_text,
         )
