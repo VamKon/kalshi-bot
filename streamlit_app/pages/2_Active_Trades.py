@@ -62,6 +62,40 @@ def kalshi_url(ticker: str) -> str:
     return f"https://kalshi.com/markets/{series}/{event}"
 
 
+def _betting_on(title: str, side: str, ticker: str = "") -> str:
+    """
+    Convert market title + side (+ ticker fallback) into plain English showing
+    who the bot is actually backing.
+
+    Strategy:
+    1. "Will [Team] win?" title format → extract team directly from title.
+    2. Ticker last segment (e.g. KXIPLGAME-26APR04RRGT-RR → "RR") → Kalshi
+       always puts the YES team as the final dash-separated segment.
+    3. Plain YES / NO fallback.
+
+    Examples:
+      "Will RR win?"            + NO  + any ticker  →  "🔴 RR loses"
+      "GT vs RR Winner?"        + NO  + "...-RR"    →  "🔴 RR loses"
+    """
+    t = (title or "").strip().rstrip("?")
+    t_lower = t.lower()
+
+    # 1. "Will X win?" pattern
+    if t_lower.startswith("will ") and " win" in t_lower:
+        team = t[5:].split(" win")[0].strip()
+        return f"🟢 {team} wins" if side.lower() == "yes" else f"🔴 {team} loses"
+
+    # 2. Ticker last segment = YES team abbreviation (e.g. "-RR" → "RR")
+    if ticker:
+        parts = ticker.split("-")
+        if len(parts) >= 2:
+            yes_team = parts[-1]
+            return f"🟢 {yes_team} wins" if side.lower() == "yes" else f"🔴 {yes_team} loses"
+
+    # 3. Fallback
+    return "🟢 YES" if side.lower() == "yes" else "🔴 NO"
+
+
 # ── Build display dataframe ─────────────────────────────────────────────────
 display_cols = [
     "id", "sport", "market_title", "market_id", "side",
@@ -89,10 +123,15 @@ if "market_id" in df_display.columns:
     df_display["resolves_in"] = df_display["market_id"].map(
         lambda tid: _hours_until(game_time_by_ticker.get(tid, ""))
     )
-# Color-coded YES/NO badge
-if "side" in df_display.columns:
-    df_display["side"] = df_display["side"].apply(
-        lambda s: "🟢 YES" if str(s).lower() == "yes" else "🔴 NO"
+# Human-readable "betting on" label derived from title + side + ticker
+if "side" in df_display.columns and "market_title" in df.columns:
+    df_display["side"] = df.apply(
+        lambda r: _betting_on(
+            str(r.get("market_title", "")),
+            str(r.get("side", "")),
+            str(r.get("market_id", "")),
+        ),
+        axis=1,
     )
 
 df_display = df_display.rename(columns={
@@ -152,13 +191,15 @@ for _, row in df.iterrows():
     conf_str  = f" — {round(float(conf) * 100, 1)}% conf" if conf else ""
     market_id = row.get("market_id", "")
     kalshi_link = f" — [View on Kalshi]({kalshi_url(market_id)})" if market_id else ""
-    title_short = str(row.get("market_title", ""))[:60]
-    sport     = row.get("sport", "")
-    side      = str(row.get("side", "")).upper()
-    stake     = row.get("stake")
-    stake_str = f" — {fmt_usd(float(stake))}" if stake else ""
+    title_full  = str(row.get("market_title", ""))
+    title_short = title_full[:60]
+    sport       = row.get("sport", "")
+    side_raw    = str(row.get("side", ""))
+    bet_label   = _betting_on(title_full, side_raw, str(row.get("market_id", "")))
+    stake       = row.get("stake")
+    stake_str   = f" — {fmt_usd(float(stake))}" if stake else ""
     with st.expander(
-        f"🟢 Trade #{int(row['id'])} — {sport} — {title_short}… ({side}{stake_str}{conf_str})"
+        f"Trade #{int(row['id'])} — {sport} — {title_short}… ({bet_label}{stake_str}{conf_str})"
     ):
         if kalshi_link:
             st.markdown(kalshi_link)

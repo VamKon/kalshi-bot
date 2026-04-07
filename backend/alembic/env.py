@@ -9,9 +9,9 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
 # Import models so Alembic can detect schema changes
-from backend.core.config import settings
-from backend.core.database import Base
-import backend.models.db_models  # noqa: F401 – registers ORM models
+from app.core.config import settings
+from app.core.database import Base
+import app.models.db_models  # noqa: F401 – registers ORM models
 
 config = context.config
 

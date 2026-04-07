@@ -69,9 +69,14 @@ Market: {title} ({sport})
 Type: {market_type} | Hours until game: {hours:.1f}h
 YES price: {yes_price:.2f} | NO price: {no_price:.2f} | Bid-ask spread: {spread:.3f}
 Sentiment: {sentiment:.3f} | Rule signal: {rule_signal:.3f}
-{price_movement_section}{sport_context}{odds_section}Headlines:
+{venue_section}{price_movement_section}{facts_section}{sport_context}{odds_section}Headlines:
 {headlines}
 """
+
+# Injected when venue is known from the Odds API home_team match.
+# For NFL/NBA/MLS: "Home: {team} — playing at {stadium}"
+# For cricket:     "Venue: {stadium}" (already includes city)
+VENUE_SECTION_TEMPLATE = "Venue: {venue} (home team: {home_team})\n"
 
 # Injected when we have a previous YES ask price to compare against.
 # A large drop in YES price = smart money on NO; a large rise = smart money on YES.
@@ -110,13 +115,26 @@ def _price_movement_section(prev_yes_ask: float | None, curr_yes_ask: float,
         interpretation=interp,
     )
 
-# Injected for cricket markets to guide sport-specific reasoning
+# Injected for cricket markets when NO structured facts are available (headlines only)
 CRICKET_CONTEXT = """\
 CRICKET SIGNALS TO PRIORITISE (if present in headlines):
 - Toss result: toss winner elects to bat/bowl — in T20 this shifts win prob ~5-8%. Weight heavily.
 - Playing XI / squad: key player absent (star batter or lead bowler) materially changes probability.
 - Pitch/venue: batting-friendly pitches favour the chasing team; bowler-friendly pitches favour the side batting first.
 - Rain: any rain forecast or wet outfield sharply reduces the favourite's edge.
+- NEVER infer venue or home/away from headlines — only use verified venue if provided above.
+"""
+
+# Injected for cricket markets when structured facts ARE available (replaces CRICKET_CONTEXT)
+CRICKET_FACTS_CONTEXT = """\
+CRICKET ANALYSIS RULES:
+1. Use ONLY the CRICKET MATCH FACTS section above — never infer venue, toss, or conditions from headlines
+2. If toss data is present, weight it heavily — in T20 this shifts win prob 5-8%
+3. If key players are missing from XI, adjust probability materially
+4. Pitch type: spin_friendly → spin bowlers dominate; pace_friendly → swing/pace matters early; batting_friendly → high scores expected
+5. Dew factor (T20 day-night): heavy dew favours the team chasing (batting second)
+6. If data_quality is "insufficient", note this and reduce confidence
+7. Consider if the sportsbook consensus already prices in known facts (toss, XI) or was set before them
 """
 
 # Injected into SONNET_USER_PROMPT when sportsbook odds are available
@@ -315,19 +333,35 @@ class AIService:
         odds_context: dict | None = None,
         prev_yes_ask: float | None = None,
         prev_scan_hours_ago: float = 2.0,
+        venue: str | None = None,
+        cricket_facts=None,   # Optional[CricketFacts] — avoids circular import
     ) -> AIDecision:
         """
         Stage 2 — Sonnet.
         Full trade decision. Only called for markets that passed quick_filter.
 
         odds_context (optional) — dict from OddsService.match_market() with keys:
-            consensus_prob, min_prob, max_prob, bookmaker_count, bookmakers, movement
+            consensus_prob, min_prob, max_prob, bookmaker_count, bookmakers, movement,
+            home_team, away_team, venue
+        venue (optional) — venue string derived from Odds API home_team via VENUE_MAP;
+            passed separately so cricket toss-triggered scans (which skip Odds API)
+            can still inject venue if available in the future.
         """
         yes_ask = float(market.get("yes_ask_dollars") or 0.5)
         yes_bid = float(market.get("yes_bid_dollars") or 0.0)
         spread  = round(yes_ask - yes_bid, 4)
         hours   = _hours_until_game(market)
         rule_signal = _compute_rule_signal(market)
+
+        # ── Build optional venue section ────────────────────────────────────
+        # Omitted entirely when venue is None (no Odds API match or empty home_team).
+        venue_section = ""
+        if venue:
+            home_team = (odds_context or {}).get("home_team", "home team")
+            venue_section = VENUE_SECTION_TEMPLATE.format(
+                venue=venue,
+                home_team=home_team,
+            )
 
         # ── Build optional odds section ─────────────────────────────────────
         odds_section = ""
@@ -348,10 +382,26 @@ class AIService:
 
         headline_text = self._headline_text(headlines)
         logger.info(
-            "Sonnet [%s] %s — headlines: %s",
-            sport, market.get("ticker", "?"), headline_text,
+            "Sonnet [%s] %s — venue=%s headlines: %s",
+            sport, market.get("ticker", "?"), venue or "unknown", headline_text,
         )
-        sport_context = CRICKET_CONTEXT if sport == "Cricket" else ""
+
+        # ── Cricket facts section ───────────────────────────────────────────
+        # When structured facts are available, inject them and use the stricter
+        # analysis rules. When absent, fall back to headline-only cricket context.
+        facts_section = ""
+        if sport == "Cricket" and cricket_facts is not None:
+            from app.services.cricket_extractor import format_facts_for_prompt
+            home_team = (odds_context or {}).get("home_team", "home team")
+            away_team = (odds_context or {}).get("away_team", "away team")
+            facts_section = format_facts_for_prompt(cricket_facts, home_team, away_team)
+
+        if sport == "Cricket" and facts_section:
+            sport_context = CRICKET_FACTS_CONTEXT
+        elif sport == "Cricket":
+            sport_context = CRICKET_CONTEXT
+        else:
+            sport_context = ""
         price_mv_section = _price_movement_section(prev_yes_ask, yes_ask, prev_scan_hours_ago)
         if price_mv_section:
             logger.info(
@@ -369,7 +419,9 @@ class AIService:
             spread=spread,
             sentiment=sentiment,
             rule_signal=rule_signal,
+            venue_section=venue_section,
             price_movement_section=price_mv_section,
+            facts_section=facts_section,
             sport_context=sport_context,
             odds_section=odds_section,
             headlines=headline_text,
@@ -379,12 +431,33 @@ class AIService:
         try:
             raw = await self._call_sonnet(user_prompt)
             data: dict[str, Any] = json.loads(self._extract_json(raw))
-            return AIDecision(
-                trade=bool(data.get("trade", False)),
-                side=str(data.get("side", "no")),
-                confidence=float(data.get("confidence", 0.0)),
-                reasoning=str(data.get("reasoning", "")),
-            )
+            trade      = bool(data.get("trade", False))
+            side       = str(data.get("side", "no"))
+            confidence = float(data.get("confidence", 0.0))
+            reasoning  = str(data.get("reasoning", ""))
+
+            # Consistency check: if reasoning argues for the opposite side, abort.
+            # The model sometimes writes correct chain-of-thought but puts the wrong
+            # side in the JSON output — executing such a trade is worse than skipping.
+            if trade and reasoning:
+                reasoning_lower = reasoning.lower()
+                yes_signals = ("edge_yes", "yes trade", "trade yes", "buy yes", "yes side")
+                no_signals  = ("edge_no",  "no trade",  "trade no",  "buy no",  "no side", "warranting a no")
+                argues_yes = any(s in reasoning_lower for s in yes_signals)
+                argues_no  = any(s in reasoning_lower for s in no_signals)
+                if (side == "yes" and argues_no and not argues_yes) or \
+                   (side == "no"  and argues_yes and not argues_no):
+                    logger.warning(
+                        "Side/reasoning mismatch — JSON side=%s but reasoning argues the opposite. "
+                        "Defaulting to no-trade. reasoning[:120]=%r",
+                        side, reasoning[:120],
+                    )
+                    return AIDecision(
+                        trade=False, side="no", confidence=0.0,
+                        reasoning=f"[ABORTED: side/reasoning mismatch — JSON said {side} but reasoning argued the opposite] {reasoning}",
+                    )
+
+            return AIDecision(trade=trade, side=side, confidence=confidence, reasoning=reasoning)
         except json.JSONDecodeError as exc:
             logger.error("Sonnet returned non-JSON: %s — raw: %r", exc, raw[:200] if raw else "<empty>")
         except Exception as exc:

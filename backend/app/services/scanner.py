@@ -25,6 +25,8 @@ from app.core.database import AsyncSessionLocal
 from app.models.db_models import Trade, MarketSignal
 from app.models.schemas import ScanResult
 from app.services.ai_service import ai_service
+from app.services.article_fetcher import article_fetcher
+from app.services.cricket_extractor import cricket_extractor, cricket_facts_cache
 from app.services.kalshi_client import kalshi_client
 from app.services.news_service import news_service
 from app.services.odds_service import odds_service
@@ -150,6 +152,25 @@ def _clean_title(title: str) -> str:
     for filler in (" win the game", " win?", " winner", " Winner", " Will ", "Will "):
         clean = clean.replace(filler, " ").strip()
     return " ".join(clean.split())
+
+
+def _parse_teams_from_title(title: str) -> tuple[str, str]:
+    """
+    Extract home/away team names from a market title like 'India vs Pakistan'.
+    Returns ("", "") if the separator is not found.
+    Handles both 'vs' and 'v' separators, case-insensitive.
+    """
+    # Strip common suffixes like '?' and trailing crud
+    clean = title.rstrip("?").strip()
+    # Remove known filler phrases that appear after team names
+    for filler in (" win the game", " winner", " Winner"):
+        clean = clean.replace(filler, "").strip()
+
+    for sep in (" vs ", " v ", " VS ", " V "):
+        if sep in clean:
+            parts = clean.split(sep, 1)
+            return parts[0].strip(), parts[1].strip()
+    return "", ""
 
 
 def _news_query(market: dict, sport: str, title: str) -> str:
@@ -518,17 +539,84 @@ class MarketScanner:
         if odds_context is None and settings.REQUIRE_SPORTSBOOK_ODDS:
             logger.info(
                 "Skipping %s — no sportsbook odds found and REQUIRE_SPORTSBOOK_ODDS=True",
-                ticker,
+                market.get("ticker", "?"),
             )
             return None
 
-        # ── Stage 2: Sonnet full decision ──────────────────────────────────
+        # ── Stage 2: Fetch cricket facts (OpenRouter extraction) ───────────────
+        # Runs for ALL cricket markets — does NOT require a sportsbook odds match.
+        # When odds_context is available we use its richer team/event metadata;
+        # otherwise we fall back to parsing team names from the market title so
+        # OpenRouter extraction still fires even when The Odds API has no match.
+        # Checks DB cache first; falls back to live article fetch + extraction.
+        # Gracefully skips when OPENROUTER_API_KEY is not set.
+        cricket_facts = None
+        if sport == "Cricket":
+            if odds_context:
+                home_team    = odds_context.get("home_team", "")
+                away_team    = odds_context.get("away_team", "")
+                event_key    = odds_context.get("event_key", "") or market.get("ticker", "")
+                competition  = odds_context.get("competition", "")
+                match_format = odds_context.get("match_format", "T20")
+                commence_dt_str = odds_context.get("commence_time", "")
+            else:
+                # No sportsbook match — parse teams from the market title
+                home_team, away_team = _parse_teams_from_title(title)
+                event_key    = market.get("event_ticker") or market.get("ticker", "")
+                competition  = (market.get("product_metadata") or {}).get("competition", "")
+                match_format = "T20"   # safe default for KXT20MATCH series
+                commence_dt_str = market.get("expected_expiration_time") or market.get("close_time") or ""
+
+            if home_team and away_team and event_key:
+                cricket_facts = await cricket_facts_cache.get(db, event_key)
+                if cricket_facts is None:
+                    logger.info(
+                        "CricketFacts cache miss for %s — fetching articles (%s vs %s)%s",
+                        event_key, home_team, away_team,
+                        " [no sportsbook match]" if not odds_context else "",
+                    )
+                    articles = await article_fetcher.fetch_match_articles(
+                        home_team, away_team, competition, max_articles=3
+                    )
+                    if articles:
+                        cricket_facts = await cricket_extractor.extract_from_multiple(
+                            articles, home_team, away_team, match_format, competition
+                        )
+                        # Parse commence_time for TTL calculation
+                        try:
+                            from datetime import datetime as _dt
+                            commence_dt = _dt.fromisoformat(
+                                commence_dt_str.replace("Z", "+00:00")
+                            ) if commence_dt_str else None
+                        except Exception:
+                            commence_dt = None
+                        await cricket_facts_cache.set(db, event_key, cricket_facts, commence_dt)
+                    else:
+                        logger.info("No articles found for %s vs %s — proceeding without facts", home_team, away_team)
+                else:
+                    logger.info(
+                        "CricketFacts cache hit for %s (confidence=%.2f, toss=%s)",
+                        event_key, cricket_facts.extraction_confidence, cricket_facts.toss_winner,
+                    )
+            else:
+                logger.info(
+                    "CricketFacts skipped for %s — could not determine team names from title '%s'",
+                    market.get("ticker", "?"), title,
+                )
+
+        # ── Stage 3: Sonnet full decision ──────────────────────────────────
+        # Extract venue from odds_context (populated by match_market via VENUE_MAP).
+        # None when no Odds API match was found — AI prompt simply omits the block.
+        venue = odds_context.get("venue") if odds_context else None
+
         rule_signal = ai_service.compute_rule_signal(market)
         decision = await ai_service.decide(
             market, sport, sentiment, headlines, market_type,
             odds_context=odds_context,
             prev_yes_ask=prev_yes_ask,
             prev_scan_hours_ago=prev_scan_hours_ago,
+            venue=venue,
+            cricket_facts=cricket_facts,
         )
         logger.info(
             "Sonnet [%s] %s — trade=%s side=%s confidence=%.2f | %s",
@@ -537,10 +625,49 @@ class MarketScanner:
             decision.reasoning[:120],
         )
 
+        # ── Correct odds_context for the actual trade side ─────────────────
+        # match_market was called with side="yes" before Sonnet ran.  If Sonnet
+        # decided to trade NO, consensus_prob in odds_context still reflects the
+        # YES side — we need to flip it so edge and Kelly use the right number.
+        if odds_context and decision.trade and decision.side == "no":
+            yes_is_home = odds_context.get("yes_is_home", True)
+            if yes_is_home:
+                # YES=home → NO=away
+                no_consensus = odds_context["consensus_away_prob"]
+            else:
+                # YES=away → NO=home
+                no_consensus = odds_context["consensus_home_prob"]
+            # min/max were computed for the YES side; invert them for NO.
+            no_min = round(1 - odds_context.get("max_prob", 1 - no_consensus), 4)
+            no_max = round(1 - odds_context.get("min_prob", 1 - no_consensus), 4)
+            odds_context = {
+                **odds_context,
+                "consensus_prob": round(no_consensus, 4),
+                "min_prob":       no_min,
+                "max_prob":       no_max,
+            }
+            logger.info(
+                "odds_context flipped to NO side: consensus_prob=%.3f (yes_is_home=%s)",
+                no_consensus, yes_is_home,
+            )
+
         # ── Persist signal (with odds data if available) ───────────────────
-        consensus_prob  = odds_context["consensus_prob"]  if odds_context else None
-        bookmaker_count = odds_context["bookmaker_count"] if odds_context else None
-        line_movement   = odds_context.get("movement")   if odds_context else None
+        # Always store the YES-side consensus so the UI edge formula
+        # (consensus_prob - yes_ask) stays correct regardless of which side
+        # the AI traded.  The flip above is only needed for Kelly sizing.
+        if odds_context:
+            yes_is_home = odds_context.get("yes_is_home", True)
+            if yes_is_home:
+                consensus_prob_yes = odds_context.get("consensus_home_prob")
+            else:
+                consensus_prob_yes = odds_context.get("consensus_away_prob")
+            consensus_prob  = consensus_prob_yes
+            bookmaker_count = odds_context["bookmaker_count"]
+            line_movement   = odds_context.get("movement")
+        else:
+            consensus_prob  = None
+            bookmaker_count = None
+            line_movement   = None
         await trading_service.save_signal(
             db=db, market_id=market.get("ticker", "UNKNOWN"),
             sport=sport, sentiment=sentiment, rule_signal=rule_signal,
@@ -549,6 +676,7 @@ class MarketScanner:
             bookmaker_count=bookmaker_count,
             line_movement=line_movement,
             yes_ask=float(market.get("yes_ask_dollars") or 0),
+            venue=venue,
         )
 
         yes_bid, yes_ask = kalshi_client.extract_best_price(market)

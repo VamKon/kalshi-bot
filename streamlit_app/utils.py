@@ -56,6 +56,17 @@ def put(path: str, json: dict) -> Any:
         return None
 
 
+def delete(path: str) -> Any:
+    """DELETE to the backend API (not cached)."""
+    try:
+        resp = httpx.delete(f"{API_BASE}{path}", timeout=10.0)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        st.error(f"API error (DELETE {path}): {exc}")
+        return None
+
+
 def pnl_color(value: float) -> str:
     """Return green or red depending on P&L sign."""
     return "green" if value >= 0 else "red"

@@ -80,16 +80,19 @@ async def get_deployed_stake(db: AsyncSession) -> float:
 
 async def get_available_cash(db: AsyncSession) -> float:
     """
-    True spendable cash = portfolio balance minus capital already deployed in open trades.
+    True spendable cash = portfolio.balance.
 
-    In normal operation portfolio.balance already has open-trade stakes deducted,
-    so available_cash ≈ portfolio.balance.  This function recomputes it from first
-    principles so it stays correct even if the balance is manually adjusted or if
-    there is ever any drift between the balance and the open trade stakes.
+    Stakes are deducted from portfolio.balance immediately when a trade is placed
+    (via update_balance(db, -stake)), so portfolio.balance already represents only
+    the cash available to trade.  Subtracting deployed_stakes a second time would
+    double-count every open position and collapse available_cash to $0 whenever
+    all cash has been deployed — which is exactly wrong.
+
+    The deployed figure is still tracked separately (get_deployed_stake) for
+    display purposes on the portfolio endpoint, but is NOT used here.
     """
     portfolio = await get_or_create_portfolio(db)
-    deployed = await get_deployed_stake(db)
-    return max(0.0, portfolio.balance - deployed)
+    return max(0.0, portfolio.balance)
 
 
 async def sync_balance_from_kalshi(db: AsyncSession) -> Optional[float]:
@@ -110,31 +113,39 @@ async def sync_balance_from_kalshi(db: AsyncSession) -> Optional[float]:
     from app.services.kalshi_client import kalshi_client  # avoid circular import
 
     kalshi_data = await kalshi_client.get_balance()
-    # Prefer portfolio_value (total); fall back to cash balance if unavailable
-    live_total = kalshi_data.get("portfolio_value") or kalshi_data.get("balance")
 
-    if live_total is None:
+    # Kalshi's /portfolio/balance returns cash-only for both `balance` and
+    # `portfolio_value` — it does NOT include the market value of open contracts.
+    # Use the cash balance as a deposit detector only: if Kalshi shows MORE cash
+    # than our DB balance, the user deposited funds and we should update upward.
+    # We never overwrite the DB balance downward from Kalshi, because a lower
+    # Kalshi cash figure just means capital is locked in open contracts — that
+    # capital is already correctly accounted for by previous update_balance(-stake)
+    # calls and should not be double-deducted.
+    kalshi_cash = kalshi_data.get("balance")
+
+    if kalshi_cash is None:
         logger.warning("sync_balance_from_kalshi: Kalshi balance unavailable, keeping DB value")
         return None
 
     portfolio = await get_or_create_portfolio(db)
-    diff = abs(live_total - portfolio.balance)
 
-    if diff > 0.05:
+    if kalshi_cash > portfolio.balance + 0.05:
+        # User deposited funds — sync upward so the bot can use the extra cash
         logger.info(
-            "Syncing balance from Kalshi: DB=$%.2f → Kalshi portfolio_value=$%.2f (diff=$%.2f)",
-            portfolio.balance, live_total, diff,
+            "Deposit detected — syncing balance upward: DB=$%.2f → Kalshi cash=$%.2f",
+            portfolio.balance, kalshi_cash,
         )
-        portfolio.balance = round(live_total, 2)
+        portfolio.balance = round(kalshi_cash, 2)
         portfolio.updated_at = datetime.utcnow()
         await db.commit()
     else:
         logger.debug(
-            "Balance in sync: DB=$%.2f, Kalshi=$%.2f (diff=$%.4f — no update needed)",
-            portfolio.balance, live_total, diff,
+            "Balance OK: DB=$%.2f, Kalshi cash=$%.2f (no upward sync needed)",
+            portfolio.balance, kalshi_cash,
         )
 
-    return live_total
+    return kalshi_cash
 
 
 async def update_balance(db: AsyncSession, delta: float) -> None:
@@ -327,14 +338,16 @@ class TradingService:
                           consensus_prob: Optional[float] = None,
                           bookmaker_count: Optional[int] = None,
                           line_movement: Optional[str] = None,
-                          yes_ask: Optional[float] = None) -> None:
+                          yes_ask: Optional[float] = None,
+                          venue: Optional[str] = None) -> None:
         signal = MarketSignal(market_id=market_id, sport=sport,
                               news_sentiment=sentiment, rule_signal=rule_signal,
                               ai_recommendation=ai_recommendation,
                               consensus_prob=consensus_prob,
                               bookmaker_count=bookmaker_count,
                               line_movement=line_movement,
-                              yes_ask=yes_ask)
+                              yes_ask=yes_ask,
+                              venue=venue)
         db.add(signal)
         await db.commit()
 
