@@ -4,14 +4,20 @@ POST /api/v1/resolve
 Checks all open trades against the Kalshi API and closes any whose
 market has a final result. Updates portfolio balance accordingly.
 
-Kalshi market lifecycle:
-  status: "active"   — betting open (demo uses "active"; production uses "open")
-  status: "closed"   — betting closed, awaiting settlement
-  status: "settled"  — final result recorded; result field = "yes" or "no"
+Kalshi market lifecycle (production API):
+  status: "open"      — betting open
+  status: "closed"    — betting closed, awaiting settlement
+  status: "finalized" — event ended, trading halted; result field may still
+                        be empty for 30–60+ min during Kalshi's settlement pass
+  status: "settled"   — result field = "yes" or "no" (fully settled)
 
-Note: The Kalshi demo/sandbox API does not settle markets — result stays
-empty and status stays "active" forever. This endpoint will resolve trades
-correctly in production once Kalshi settles the market.
+Resolution strategy:
+  1. Explicit result field — used once Kalshi writes "yes"/"no"
+  2. Price convergence fallback — yes_ask/bid converge to $1.00 or $0.00 at
+     finalization even before the result field is written; used when status is
+     a known final state but result is still empty
+
+Note: The demo/sandbox API does not settle markets.
 """
 import logging
 from datetime import datetime
@@ -36,22 +42,51 @@ SETTLED_STATUSES = {"settled", "finalized", "resolved"}
 def _extract_result(market_data: dict) -> str | None:
     """
     Return "yes"/"no" if Kalshi has settled this market, else None.
-    Checks both primary and alternate result field names across API versions.
+
+    Kalshi's production API uses a two-step lifecycle:
+      1. status → "finalized": event ended, trading closed, but result field
+         may still be empty for 30–60+ minutes during their settlement pass.
+      2. result → "yes"|"no": populated after official settlement.
+
+    Primary: check the result field explicitly.
+    Fallback: when status is finalized but result is still empty, infer the
+    outcome from price convergence — Kalshi sets yes_ask to $1.00 (YES won)
+    or $0.00 (YES lost) even before writing the result field.
     """
     status     = (market_data.get("status") or "").lower()
     result_val = (market_data.get("result") or "").strip().lower()
     result_alt = (market_data.get("market_result") or "").strip().lower()
 
-    # Production: status is a known settled state
-    if status in SETTLED_STATUSES:
-        val = result_val or result_alt
-        if val in ("yes", "no"):
-            return val
-
-    # Also accept result field even if status is unrecognised (API changes)
+    # Primary: explicit result field (works once Kalshi writes it)
     for val in (result_val, result_alt):
         if val in ("yes", "no"):
             return val
+
+    # Fallback: price convergence for finalized-but-not-yet-result markets.
+    # Only applied when the market is in a known finalized state to avoid
+    # mis-reading a live market with a temporarily lopsided spread.
+    if status in SETTLED_STATUSES:
+        try:
+            yes_ask = float(market_data.get("yes_ask_dollars") or -1)
+            yes_bid = float(market_data.get("yes_bid_dollars") or -1)
+            # Use the midpoint so a single missing price doesn't mislead us.
+            # Both should be ≥ 0 for this branch to fire.
+            if yes_ask >= 0 and yes_bid >= 0:
+                mid = (yes_ask + yes_bid) / 2
+                if mid >= 0.95:
+                    logger.info(
+                        "Price-convergence resolution: yes_ask=%.2f yes_bid=%.2f → YES",
+                        yes_ask, yes_bid,
+                    )
+                    return "yes"
+                if mid <= 0.05:
+                    logger.info(
+                        "Price-convergence resolution: yes_ask=%.2f yes_bid=%.2f → NO",
+                        yes_ask, yes_bid,
+                    )
+                    return "no"
+        except (TypeError, ValueError):
+            pass
 
     return None
 
