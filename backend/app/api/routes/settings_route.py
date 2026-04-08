@@ -5,7 +5,7 @@ from app.core.config import settings
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
-ALL_SPORTS = ["NFL", "NBA", "MLS", "Cricket"]
+ALL_SPORTS = ["Cricket"]
 
 class SettingsPatch(BaseModel):
     scan_interval_hours: Optional[int] = None

@@ -25,26 +25,9 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Maps product_metadata.competition values → our sport labels.
+# Maps product_metadata.competition values → our sport label (Cricket only).
 # Add entries here as new competitions are discovered on Kalshi.
 COMPETITION_TO_SPORT: dict[str, str] = {
-    # NBA
-    "NBA": "NBA",
-    # NFL
-    "NFL": "NFL",
-    # Soccer / MLS
-    "MLS": "MLS",
-    "Liga MX": "MLS",
-    "Premier League": "MLS",
-    "Bundesliga": "MLS",
-    "Serie A": "MLS",
-    "La Liga": "MLS",
-    "Champions League": "MLS",
-    "Europa League": "MLS",
-    "Ligue 1": "MLS",
-    "Eredivisie": "MLS",
-    "England Women's Super League": "MLS",
-    # Cricket
     "IPL": "Cricket",
     "T20": "Cricket",
     "T20 Match": "Cricket",
@@ -53,16 +36,16 @@ COMPETITION_TO_SPORT: dict[str, str] = {
     "ODI": "Cricket",
     "Test Match": "Cricket",
     "CPL": "Cricket",
+    "SA20": "Cricket",
+    "The Hundred": "Cricket",
+    "Vitality Blast": "Cricket",
 }
 
-# Fallback keyword matching on text fields when product_metadata is absent
+# Fallback keyword matching on text fields when product_metadata is absent (Cricket only)
 SPORT_KEYWORDS: dict[str, list[str]] = {
-    "NFL": ["nfl", "super bowl", "kxmnfl"],
-    "NBA": ["nba", "kxmnba"],
-    "MLS": ["mls", " soccer", "liga mx", "premier league", "bundesliga", "serie a",
-            "la liga", "champions league", "kxligamxgame", "kxewslgame"],
     "Cricket": ["cricket", "ipl", "t20", "kxt20match", "test match", "odi", "bbl",
-                "big bash", "psl", "cpl", "wicket", "innings"],
+                "big bash", "psl", "cpl", "sa20", "the hundred", "vitality blast",
+                "wicket", "innings"],
 }
 
 
@@ -256,6 +239,21 @@ class KalshiClient:
                         ticker = market.get("ticker")
                         if not ticker or ticker in seen:
                             continue
+                        # For domestic cricket GAME series, require "GAME" in the
+                        # market ticker itself.  This blocks tournament/futures
+                        # markets (e.g. KXPSL-26-HYD) that Kalshi may nest inside
+                        # a KXPSLGAME series even though they are not per-game markets.
+                        # International series (KXT20MATCH, KXODI, KXTEST) are exempt
+                        # — their per-game tickers never contain the word GAME.
+                        INTL_PREFIXES = ("KXT20MATCH", "KXODI", "KXTEST")
+                        is_intl = any(series_ticker.upper().startswith(p) for p in INTL_PREFIXES)
+                        if not is_intl and series_ticker.upper().endswith("GAME"):
+                            if "GAME" not in ticker.upper():
+                                logger.debug(
+                                    "Skipping %s — no GAME in ticker for domestic series %s",
+                                    ticker, series_ticker,
+                                )
+                                continue
                         # Inject series_ticker so classify_sport() has more signal
                         if not market.get("series_ticker"):
                             market["series_ticker"] = series_ticker
@@ -412,12 +410,10 @@ class KalshiClient:
 
         Detection order (most-reliable signal first):
 
-        1. Series prefix rules:
-           - *WINS series (KXNBAWINS, KXNFLWINS …) → total  (season win totals)
-           - *GAME series (KXSERIEAGAME, KXLIGAMXGAME …) → game_winner
-             All Kalshi soccer per-game series end with the "GAME" suffix.
-           - KXNBA / KXNFL / KXSUPERBOWL with no "WINS" suffix → game_winner
-             (These are per-game NBA/NFL markets, not season totals.)
+        1. Series prefix rules (Cricket only):
+           - *GAME suffix (KXIPLGAME, KXPSLGAME, …) → game_winner
+             All domestic cricket per-game series end with the "GAME" suffix.
+           - KXT20MATCH / KXODI / KXTEST → game_winner (international cricket)
 
         2. Ticker / title keyword checks (fallback for any unrecognised series).
         """
@@ -427,27 +423,13 @@ class KalshiClient:
 
         # ── Series-level rules (highest confidence) ─────────────────────────
         if series:
-            # Season win-total markets (e.g. KXNBAWINS-25-MEM → how many wins this season)
-            if series.endswith("WINS") or "WINS" in series:
-                return "total"
-
-            # All soccer per-game series have a *GAME suffix
+            # All domestic cricket per-game series end with GAME
+            # (e.g. KXIPLGAME, KXPSLGAME, KXCPLGAME, KXSA20GAME, …)
             if series.endswith("GAME"):
                 return "game_winner"
 
-            # KXLOSEBARCA (Barcelona-specific game markets) — also game winners
-            if "LOSEBARCA" in series:
-                return "game_winner"
-
-            # NBA and NFL per-game series (already excluded *WINS above)
-            if series.startswith(("KXNBA", "KXNFL", "KXSUPERBOWL")):
-                return "game_winner"
-
-            # Cricket per-game match series
-            if series.startswith((
-                "KXT20MATCH", "KXBBL", "KXPSL", "KXCPL", "KXODI", "KXTEST",
-                "KXIPL", "KXSA20", "KXVITBLAST", "KXHUNDRED",
-            )):
+            # International cricket per-game series
+            if series.startswith(("KXT20MATCH", "KXODI", "KXTEST")):
                 return "game_winner"
 
         # ── Ticker / title keyword fallback ──────────────────────────────────

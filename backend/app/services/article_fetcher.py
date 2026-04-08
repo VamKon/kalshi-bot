@@ -1,19 +1,17 @@
 """
 Fetch full cricket articles for OpenRouter fact extraction.
 
-Three sources used to discover article URLs:
-  1. Google News RSS search  — match-specific query, direct article URLs
+Two sources used to discover article URLs:
+  1. Google News RSS search  — match-specific query, capped at 10 URLs
   2. ESPNcricinfo RSS        — global feed cached once, keyword-filtered for URLs only
-  3. Cricbuzz RSS            — global feed cached once, keyword-filtered for URLs only
 
 ESPNcricinfo article PAGES are NOT fetched — they return 403 Forbidden.
 The ESPN RSS is only used to collect candidate URLs that are skipped during
-the full-text fetch phase (only Google News and Cricbuzz article pages are fetched).
+the full-text fetch phase (only Google News article pages are fetched).
 
 Caching:
   - Google News RSS results: per-query, in-memory, 2-hour TTL
   - ESPNcricinfo RSS feed:   singleton, cached for process lifetime
-  - Cricbuzz RSS feed:       singleton, cached for process lifetime
 
 Article fetch strategy: sequential with early exit — fetch one URL at a time,
 stop as soon as max_articles successful full-text fetches are collected.
@@ -40,7 +38,9 @@ MAX_ARTICLE_CHARS = 10_000
 GOOGLE_NEWS_CACHE_TTL = 2 * 60 * 60  # 2 hours
 
 ESPNCRICINFO_RSS_URL = "https://www.espncricinfo.com/rss/content/story/feeds/0.xml"
-CRICBUZZ_RSS_URL     = "https://www.cricbuzz.com/cricket-news/rss-feed"
+
+# Max Google News URLs to collect per query (avoids fetching 100 candidate URLs)
+GOOGLE_NEWS_MAX_URLS = 10
 
 # ESPNcricinfo article pages always return 403 — skip fetching them.
 # Only use ESPN RSS for keyword matching; let Cricbuzz / Google News supply text.
@@ -80,7 +80,6 @@ class ArticleFetcher:
 
         # Global RSS feed caches (fetched once per process lifetime)
         self._espn_raw: list[dict] | None = None   # [{title, url, description}]
-        self._cb_raw:   list[dict] | None = None
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
@@ -98,8 +97,7 @@ class ArticleFetcher:
           - ESPNcricinfo: RSS title+description used directly as mini-articles
             (article pages block bots with 403; RSS summaries are free data).
           - Google News:  search RSS → follow redirect URLs to full article text.
-            Google results naturally include ESPN, Cricbuzz, and other sites.
-          - Cricbuzz:     RSS keyword-filtered → follow article URLs for full text.
+            Capped at GOOGLE_NEWS_MAX_URLS (10) candidates to avoid excessive fetching.
 
         Article fetch is sequential with early exit to avoid rate limits.
         Returns list of {"text", "url", "title"}.
@@ -120,19 +118,18 @@ class ArticleFetcher:
                 "ArticleFetcher: ESPN RSS mini-articles for '%s': %d", query, len(espn_articles)
             )
 
-            # ── Step 2: collect fetchable URLs from Google News + Cricbuzz ──────
+            # ── Step 2: collect fetchable URLs from Google News (capped at 10) ──
             gnews_urls = await self._google_news_urls(client, query)
-            cb_urls    = await self._rss_urls(client, kw)
 
             logger.info(
-                "ArticleFetcher: fetchable URL candidates for '%s' — Google News: %d, Cricbuzz: %d",
-                query, len(gnews_urls), len(cb_urls),
+                "ArticleFetcher: fetchable URL candidates for '%s' — Google News: %d",
+                query, len(gnews_urls),
             )
 
-            # Deduplicate URLs; Google News first (broadest coverage), then Cricbuzz
+            # Deduplicate URLs
             seen: set[str] = set()
             all_urls: list[str] = []
-            for url in gnews_urls + cb_urls:
+            for url in gnews_urls:
                 if url not in seen:
                     seen.add(url)
                     all_urls.append(url)
@@ -206,6 +203,7 @@ class ArticleFetcher:
                 if link_m:
                     urls.append(link_m.group(1).strip())
 
+            urls = urls[:GOOGLE_NEWS_MAX_URLS]
             self._gnews_cache[query] = (time.time(), urls)
             logger.info(
                 "ArticleFetcher: Google News RSS fetched %d URLs for '%s'", len(urls), query
@@ -247,31 +245,6 @@ class ArticleFetcher:
                         "title": item["title"],
                     })
         return articles
-
-    # ── Cricbuzz RSS (singleton cache, keyword-filtered URLs) ──────────────────
-
-    async def _rss_urls(
-        self,
-        client: httpx.AsyncClient,
-        keywords: set[str],
-    ) -> list[str]:
-        """
-        Return Cricbuzz article URLs that match any keyword.
-        The raw feed is fetched once and cached for the process lifetime.
-        """
-        if self._cb_raw is None:
-            self._cb_raw = await self._fetch_rss_items(client, CRICBUZZ_RSS_URL)
-            logger.info(
-                "ArticleFetcher: Cricbuzz RSS cached %d items", len(self._cb_raw)
-            )
-        items = self._cb_raw
-
-        matched: list[str] = []
-        for item in items:
-            text = (item["title"] + " " + item.get("description", "")).lower()
-            if any(kw in text for kw in keywords):
-                matched.append(item["url"])
-        return matched
 
     async def _fetch_rss_items(
         self,

@@ -126,7 +126,8 @@ def _is_blocked_competition(market: dict) -> Optional[str]:
         return None  # both teams recognised — allow it
 
     # ── Cricket domestic series — competition must be in the allowlist ─────────
-    DOMESTIC_PREFIXES = ("KXIPL", "KXPSL", "KXCPL", "KXSA20", "KXVITBLAST", "KXHUNDRED", "KXBBL")
+    # These prefixes match the *GAME series only (e.g. KXIPLGAME-...).
+    DOMESTIC_PREFIXES = ("KXIPLGAME", "KXPSLGAME", "KXCPLGAME", "KXSA20GAME", "KXVITBLASTGAME", "KXHUNDREDGAME", "KXBBLGAME")
     if any(ticker.startswith(p) for p in DOMESTIC_PREFIXES):
         if any(league in haystack for league in ALLOWED_DOMESTIC_CRICKET_LEAGUES):
             return None  # recognised league — allow it
