@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter, Depends
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.db_models import MarketSignal
 from app.models.schemas import MarketInfo
@@ -45,6 +46,12 @@ async def list_markets(sport: str | None = None, db: AsyncSession = Depends(get_
             continue
         if sport and detected_sport != sport:
             continue
+
+        # Apply the same game-winner filter used by the scanner
+        if settings.GAME_WINNER_ONLY:
+            market_type = kalshi_client.get_market_type(m)
+            if market_type != "game_winner":
+                continue
 
         yes_bid, yes_ask = kalshi_client.extract_best_price(m)
         sig = signals.get(m.get("ticker", ""))

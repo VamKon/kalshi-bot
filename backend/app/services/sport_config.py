@@ -7,19 +7,64 @@ Series → Events → Markets hierarchy.
 
 Add new series prefixes here as they are discovered on the production API.
 
-BLOCKLIST
----------
-BLOCKED_COMPETITIONS filters out specific competitions/leagues by name even if
-their series ticker prefix is included above.  Use this to exclude obscure
-international friendlies, qualifiers, or leagues with poor sportsbook coverage
-where the odds-based edge calculation is unreliable.
+ALLOWLISTS (cricket)
+--------------------
+ALLOWED_INTERNATIONAL_CRICKET_TEAMS — only international fixtures where BOTH
+  teams are in this set are traded.  Any match involving a team not listed here
+  (associate nations, Americas / Africa / East Asia regions etc.) is skipped.
+
+ALLOWED_DOMESTIC_CRICKET_LEAGUES — domestic T20 leagues the bot will trade.
+  All other domestic leagues (ILT20, MCA Big Bash, etc.) are blocked.  This is
+  matched against `product_metadata.competition` and the market title.
+
+BLOCKED_COMPETITIONS
+--------------------
+Hard blocklist matched case-insensitively against competition name / title.
+Used for soccer and any cricket leagues not in the domestic allowlist.
 """
 
+# ── Allowed international cricket nations ─────────────────────────────────────
+# Both teams in a match MUST appear in this set for the market to be traded.
+# Matched against the lowercased market title + competition string.
+ALLOWED_INTERNATIONAL_CRICKET_TEAMS: set[str] = {
+    "india",
+    "australia",
+    "england",
+    "new zealand",
+    "south africa",
+    "west indies",
+    "sri lanka",
+    "bangladesh",
+    "afghanistan",
+    "ireland",
+    "pakistan",
+    "zimbabwe",
+}
+
+# ── Allowed domestic cricket leagues ──────────────────────────────────────────
+# Any domestic cricket competition NOT in this set is blocked.
+# Matched case-insensitively against `product_metadata.competition` and title.
+ALLOWED_DOMESTIC_CRICKET_LEAGUES: set[str] = {
+    "ipl",
+    "indian premier league",
+    "bbl",
+    "big bash",
+    "big bash league",
+    "psl",
+    "pakistan super league",
+    "vitality blast",
+    "t20 blast",
+    "sa20",
+    "cpl",
+    "caribbean premier league",
+    "the hundred",
+    "hundred",
+}
+
 # ── Competition blocklist ──────────────────────────────────────────────────────
-# Matched case-insensitively against the `competition` field in product_metadata
-# and against the market title.  Add any league/competition you don't want traded.
+# Matched case-insensitively against `competition` field and market title.
 BLOCKED_COMPETITIONS: set[str] = {
-    # International soccer friendlies & qualifiers — poor liquidity, no sharp lines
+    # Soccer — friendlies, qualifiers, and other low-liquidity competitions
     "concacaf",
     "conmebol",
     "international friendly",
@@ -31,24 +76,20 @@ BLOCKED_COMPETITIONS: set[str] = {
     "afcon",
     "afc cup",
     "caf",
-    # Women's competitions (low Kalshi volume, thin sportsbook coverage)
+    # Women's competitions (low Kalshi volume)
     "nwsl",
-    # Add more as you encounter them — check the Markets page ticker prefix
-}
-
-# ── Cricket minnow team blocklist ──────────────────────────────────────────────
-# T20 internationals between these associate/emerging nations have no sportsbook
-# coverage, making our odds-based edge calculation unreliable.  Matches where
-# EITHER team is in this list are skipped.
-BLOCKED_CRICKET_TEAMS: set[str] = {
-    "costa rica", "brazil", "argentina", "panama", "belize", "mexico",
-    "canada", "usa", "united states",
-    "germany", "france", "italy", "spain", "netherlands",
-    "kenya", "nigeria", "ghana", "uganda", "tanzania",
-    "bahrain", "kuwait", "qatar", "saudi arabia", "uae",
-    "singapore", "malaysia", "thailand", "japan", "china",
-    "peru", "chile", "colombia", "venezuela",
-    # Add any other team you see appearing in obscure T20 markets
+    # Cricket leagues NOT in ALLOWED_DOMESTIC_CRICKET_LEAGUES
+    "ilt20",            # UAE International League T20
+    "mca big bash",     # Malaysian/other regional Big Bash clones
+    "lanka premier league",
+    "lpl",
+    "bangladesh premier league",
+    "bpl",
+    "super smash",      # New Zealand domestic T20
+    "ram slam",
+    "t20 challenge",    # India's domestic Vijay Hazare / Syed Mushtaq T20
+    "legends league",
+    "minor cricket",
 }
 
 SPORT_CONFIGS: dict[str, dict] = {
@@ -90,20 +131,29 @@ SPORT_CONFIGS: dict[str, dict] = {
         ),
     },
     "Cricket": {
-        "description": "Cricket game and futures markets",
+        "description": "Cricket game markets — allowed leagues and top-12 nations only",
         "known_series_prefixes": [
-            "KXT20MATCH",  # T20 internationals — confirmed in series list
-            "KXIPL",       # IPL per-game markets (active from April 2026)
-            # KXBBL removed — Kalshi uses this prefix for Basketball Bundesliga
-            "KXPSL",       # Pakistan Super League
-            "KXCPL",       # Caribbean Premier League
-            "KXODI",       # ODI matches
-            "KXTEST",      # Test matches
-            "KXCRIC",      # Generic cricket
+            # ── International ──────────────────────────────────────────────────
+            "KXT20MATCH",   # T20 internationals (confirmed active)
+            "KXODI",        # ODI internationals
+            "KXTEST",       # Test matches
+            # ── Domestic leagues (ALLOWED_DOMESTIC_CRICKET_LEAGUES) ───────────
+            "KXIPL",        # Indian Premier League (confirmed active April 2026)
+            "KXPSL",        # Pakistan Super League
+            "KXCPL",        # Caribbean Premier League
+            "KXSA20",       # SA20 — verify prefix against live Kalshi series list
+            "KXVITBLAST",   # Vitality Blast (England) — verify prefix
+            "KXHUNDRED",    # The Hundred (England) — verify prefix
+            # BBL note: KXBBL collides with Basketball Bundesliga on Kalshi.
+            # If Kalshi uses a distinct prefix for Big Bash cricket, add it here.
+            # KXCRIC removed — too generic, pulls in unrelated markets
         ],
         "notes": (
-            "IPL per-game markets confirmed active April 2026 under KXIPL prefix. "
-            "T20 internationals via KXT20MATCH series."
+            "International matches are further filtered by ALLOWED_INTERNATIONAL_CRICKET_TEAMS "
+            "(both teams must be in the top-12 nations list). "
+            "Domestic leagues are filtered by ALLOWED_DOMESTIC_CRICKET_LEAGUES. "
+            "SA20/Vitality Blast/Hundred prefixes need verification against the live "
+            "Kalshi /series endpoint — add the correct prefix if the default is wrong."
         ),
     },
 }

@@ -444,7 +444,10 @@ class KalshiClient:
                 return "game_winner"
 
             # Cricket per-game match series
-            if series.startswith(("KXT20MATCH", "KXBBL", "KXPSL", "KXCPL", "KXODI", "KXTEST")):
+            if series.startswith((
+                "KXT20MATCH", "KXBBL", "KXPSL", "KXCPL", "KXODI", "KXTEST",
+                "KXIPL", "KXSA20", "KXVITBLAST", "KXHUNDRED",
+            )):
                 return "game_winner"
 
         # ── Ticker / title keyword fallback ──────────────────────────────────

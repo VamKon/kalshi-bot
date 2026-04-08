@@ -30,7 +30,11 @@ from app.services.cricket_extractor import cricket_extractor, cricket_facts_cach
 from app.services.kalshi_client import kalshi_client
 from app.services.news_service import news_service
 from app.services.odds_service import odds_service
-from app.services.sport_config import BLOCKED_COMPETITIONS, BLOCKED_CRICKET_TEAMS
+from app.services.sport_config import (
+    ALLOWED_DOMESTIC_CRICKET_LEAGUES,
+    ALLOWED_INTERNATIONAL_CRICKET_TEAMS,
+    BLOCKED_COMPETITIONS,
+)
 from app.services.trading_service import trading_service, get_available_cash, sync_balance_from_kalshi
 
 logger = logging.getLogger(__name__)
@@ -77,25 +81,61 @@ def _hours_until_close(market: dict) -> Optional[float]:
 
 def _is_blocked_competition(market: dict) -> Optional[str]:
     """
-    Return a reason string if this market belongs to a blocked competition,
-    otherwise None.  Checks product_metadata.competition and the market title.
-    Also blocks T20/ODI/Test cricket matches involving minnow nations with no
-    sportsbook coverage (BLOCKED_CRICKET_TEAMS).
+    Return a reason string if this market should be skipped, otherwise None.
+
+    Cricket uses two allowlists (not a blocklist):
+
+    1. International series (KXT20MATCH, KXODI, KXTEST):
+       BOTH teams must appear in ALLOWED_INTERNATIONAL_CRICKET_TEAMS.
+       Any match involving a nation not in that set is skipped.
+
+    2. Domestic series (KXIPL, KXPSL, KXCPL, KXSA20, KXVITBLAST, KXHUNDRED):
+       The competition name must match ALLOWED_DOMESTIC_CRICKET_LEAGUES.
+       Any domestic league not in the allowlist is skipped.
+
+    Non-cricket markets use the BLOCKED_COMPETITIONS blocklist as before.
     """
     competition = (market.get("product_metadata") or {}).get("competition", "")
     title       = market.get("title", "") or market.get("subtitle", "")
     haystack    = f"{competition} {title}".lower()
+    ticker      = (market.get("series_ticker") or market.get("ticker") or "").upper()
 
+    # ── General blocklist (soccer, etc.) ──────────────────────────────────────
     for blocked in BLOCKED_COMPETITIONS:
         if blocked in haystack:
-            return f"blocked competition '{blocked}' found in '{competition or title}'"
+            return f"blocked competition '{blocked}' in '{competition or title}'"
 
-    # Block cricket matches involving minnow/associate nations
-    ticker = (market.get("series_ticker") or market.get("ticker") or "").upper()
-    if any(ticker.startswith(p) for p in ("KXT20MATCH", "KXODI", "KXTEST", "KXCRIC")):
-        for team in BLOCKED_CRICKET_TEAMS:
-            if team in haystack:
-                return f"cricket minnow team '{team}' — no sportsbook coverage"
+    # ── Cricket international series ──────────────────────────────────────────
+    # Approved nations (both teams in ALLOWED_INTERNATIONAL_CRICKET_TEAMS) are
+    # traded at the normal MIN_CONFIDENCE threshold.
+    # Unapproved T20 internationals (KXT20MATCH only) are allowed through but
+    # held to a stricter 0.60 confidence threshold applied in _analyze_market.
+    # ODI / Test unapproved matchups are still blocked (less Kalshi volume).
+    INTL_PREFIXES = ("KXT20MATCH", "KXODI", "KXTEST", "KXCRIC")
+    if any(ticker.startswith(p) for p in INTL_PREFIXES):
+        matched = [t for t in ALLOWED_INTERNATIONAL_CRICKET_TEAMS if t in haystack]
+        if len(matched) < 2:
+            # Allow unapproved T20 internationals through — stricter threshold
+            # enforced later in _analyze_market.  Block ODI / Test unapproved.
+            if ticker.startswith("KXT20MATCH"):
+                return None  # unapproved T20I — allow, higher threshold later
+            return (
+                f"international cricket — fewer than 2 allowed nations found "
+                f"(found: {matched or 'none'}) in '{title}'"
+            )
+        return None  # both teams recognised — allow it
+
+    # ── Cricket domestic series — competition must be in the allowlist ─────────
+    DOMESTIC_PREFIXES = ("KXIPL", "KXPSL", "KXCPL", "KXSA20", "KXVITBLAST", "KXHUNDRED", "KXBBL")
+    if any(ticker.startswith(p) for p in DOMESTIC_PREFIXES):
+        if any(league in haystack for league in ALLOWED_DOMESTIC_CRICKET_LEAGUES):
+            return None  # recognised league — allow it
+        # Fallback: if no competition metadata, trust the series prefix
+        if not competition:
+            return None
+        return (
+            f"domestic cricket league '{competition}' not in allowed leagues list"
+        )
 
     return None
 
@@ -576,7 +616,7 @@ class MarketScanner:
                         " [no sportsbook match]" if not odds_context else "",
                     )
                     articles = await article_fetcher.fetch_match_articles(
-                        home_team, away_team, competition, max_articles=3
+                        home_team, away_team, competition, max_articles=10
                     )
                     if articles:
                         cricket_facts = await cricket_extractor.extract_from_multiple(
@@ -678,6 +718,23 @@ class MarketScanner:
             yes_ask=float(market.get("yes_ask_dollars") or 0),
             venue=venue,
         )
+
+        # ── Stricter threshold for unapproved T20 internationals ──────────────
+        # KXT20MATCH markets where neither/only one team is in
+        # ALLOWED_INTERNATIONAL_CRICKET_TEAMS are allowed through the pre-filter
+        # but require confidence >= 0.60 (vs the normal MIN_CONFIDENCE of 0.50).
+        ticker = (market.get("series_ticker") or market.get("ticker") or "").upper()
+        if ticker.startswith("KXT20MATCH"):
+            haystack = f"{market.get('title', '')} {(market.get('product_metadata') or {}).get('competition', '')}".lower()
+            matched_nations = [t for t in ALLOWED_INTERNATIONAL_CRICKET_TEAMS if t in haystack]
+            if len(matched_nations) < 2:
+                UNAPPROVED_T20I_MIN_CONFIDENCE = 0.60
+                if decision.confidence < UNAPPROVED_T20I_MIN_CONFIDENCE:
+                    logger.info(
+                        "Skipping unapproved T20I %s — confidence %.2f < %.2f",
+                        market.get("ticker", "?"), decision.confidence, UNAPPROVED_T20I_MIN_CONFIDENCE,
+                    )
+                    return None
 
         yes_bid, yes_ask = kalshi_client.extract_best_price(market)
 
