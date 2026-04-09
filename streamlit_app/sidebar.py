@@ -166,8 +166,7 @@ def render_sidebar() -> None:
                             unsafe_allow_html=True,
                         )
                         if detail:
-                            with st.expander("Stack trace", expanded=False):
-                                st.code(detail, language="python")
+                            st.code(detail, language="python")
 
                     if len(alerts) > 10:
                         st.caption(f"… and {len(alerts) - 10} more. Check Settings to clear.")
