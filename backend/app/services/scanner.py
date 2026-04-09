@@ -592,6 +592,10 @@ class MarketScanner:
         # Checks DB cache first; falls back to live article fetch + extraction.
         # Gracefully skips when OPENROUTER_API_KEY is not set.
         cricket_facts = None
+        # articles is hoisted here so it can be passed to ai_service.decide() for
+        # raw-text injection into the Sonnet prompt, even when OpenRouter extraction
+        # succeeds (providing both structured facts AND article excerpts to Claude).
+        articles: list[dict] = []
         if sport == "Cricket":
             if odds_context:
                 home_team    = odds_context.get("home_team", "")
@@ -658,6 +662,7 @@ class MarketScanner:
             prev_scan_hours_ago=prev_scan_hours_ago,
             venue=venue,
             cricket_facts=cricket_facts,
+            articles=articles,   # freshly fetched article bodies (empty on cache hit)
         )
         logger.info(
             "Sonnet [%s] %s — trade=%s side=%s confidence=%.2f | %s",

@@ -69,8 +69,18 @@ Market: {title} ({sport})
 Type: {market_type} | Hours until game: {hours:.1f}h
 YES price: {yes_price:.2f} | NO price: {no_price:.2f} | Bid-ask spread: {spread:.3f}
 Sentiment: {sentiment:.3f} | Rule signal: {rule_signal:.3f}
-{venue_section}{price_movement_section}{facts_section}{sport_context}{odds_section}Headlines:
+{venue_section}{price_movement_section}{facts_section}{sport_context}{odds_section}{articles_section}Headlines:
 {headlines}
+"""
+
+# Injected when full article text was freshly fetched by ArticleFetcher (cache miss).
+# Capped at 2 articles × 1 500 chars to stay within the token budget (~750 tokens).
+# When structured CRICKET MATCH FACTS are also present above, those take precedence
+# for toss/XI/pitch data; the article excerpts add narrative context (momentum,
+# expert analysis, any detail the structured extractor may have missed).
+ARTICLES_SECTION_TEMPLATE = """\
+ARTICLE EXCERPTS (full text — use for context not captured in structured facts above):
+{articles_text}
 """
 
 # Injected when venue is known from the Odds API home_team match.
@@ -334,7 +344,8 @@ class AIService:
         prev_yes_ask: float | None = None,
         prev_scan_hours_ago: float = 2.0,
         venue: str | None = None,
-        cricket_facts=None,   # Optional[CricketFacts] — avoids circular import
+        cricket_facts=None,        # Optional[CricketFacts] — avoids circular import
+        articles: list[dict] | None = None,  # full article bodies from ArticleFetcher
     ) -> AIDecision:
         """
         Stage 2 — Sonnet.
@@ -402,6 +413,7 @@ class AIService:
             sport_context = CRICKET_CONTEXT
         else:
             sport_context = ""
+
         price_mv_section = _price_movement_section(prev_yes_ask, yes_ask, prev_scan_hours_ago)
         if price_mv_section:
             logger.info(
@@ -409,6 +421,36 @@ class AIService:
                 sport, market.get("ticker", "?"),
                 prev_yes_ask, yes_ask, yes_ask - prev_yes_ask,
             )
+
+        # ── Build article excerpts section ──────────────────────────────────
+        # Include up to 2 freshly-fetched articles (1 500 chars each ≈ 375 tokens
+        # per article) so Sonnet sees the raw journalist analysis — match previews,
+        # momentum signals, expert opinions — not just the structured extraction.
+        # Only populated on a cache miss; on a cache hit articles=[] so this is "".
+        articles_section = ""
+        if articles:
+            excerpts: list[str] = []
+            for i, art in enumerate(articles[:2], 1):
+                text = (art.get("text") or "").strip()
+                if not text:
+                    continue
+                text = text[:1500]
+                art_title = art.get("title") or f"Article {i}"
+                url = art.get("url") or ""
+                try:
+                    domain = url.split("/")[2]
+                except IndexError:
+                    domain = url
+                excerpts.append(f'[{i}] "{art_title}" ({domain})\n{text}')
+            if excerpts:
+                articles_section = ARTICLES_SECTION_TEMPLATE.format(
+                    articles_text="\n\n---\n\n".join(excerpts)
+                )
+                logger.info(
+                    "Sonnet [%s] %s — injecting %d article excerpt(s) into prompt",
+                    sport, market.get("ticker", "?"), len(excerpts),
+                )
+
         user_prompt = SONNET_USER_PROMPT.format(
             title=market.get("title", "Unknown"),
             sport=sport,
@@ -424,6 +466,7 @@ class AIService:
             facts_section=facts_section,
             sport_context=sport_context,
             odds_section=odds_section,
+            articles_section=articles_section,
             headlines=headline_text,
         )
 
