@@ -1,21 +1,26 @@
 """
 Fetch full cricket articles for OpenRouter fact extraction.
 
-Two sources used to discover article URLs:
-  1. Google News RSS search  — match-specific query, capped at 10 URLs
-  2. ESPNcricinfo RSS        — global feed cached once, keyword-filtered for URLs only
+Source priority (highest quality first):
+  1. CricBuzz         — RSS content:encoded (full HTML) → page fetch fallback
+  2. CricTracker      — RSS content:encoded → page fetch fallback
+  3. Sportskeeda      — RSS content:encoded → page fetch fallback; good IPL/T20
+  4. CricketAddictor  — RSS description only (Cloudflare blocks page fetches)
+  5. ESPNcricinfo     — RSS title+description only (pages block with 403)
+  6. Google News      — fallback; known paywall domains pre-filtered
 
-ESPNcricinfo article PAGES are NOT fetched — they return 403 Forbidden.
-The ESPN RSS is only used to collect candidate URLs that are skipped during
-the full-text fetch phase (only Google News article pages are fetched).
+Page extraction uses trafilatura (primary) with BeautifulSoup <p> fallback.
+When content:encoded is ≥500 chars, the page fetch is skipped entirely.
 
-Caching:
-  - Google News RSS results: per-query, in-memory, 2-hour TTL
-  - ESPNcricinfo RSS feed:   singleton, cached for process lifetime
+All RSS feeds are cached with a 2-hour TTL — one network call per feed per cache
+window. Stale caches are refreshed automatically so new match announcements are
+picked up without a pod restart.
+
+Google News search results are cached per-query with a 2-hour TTL.
 
 Article fetch strategy: sequential with early exit — fetch one URL at a time,
 stop as soon as max_articles successful full-text fetches are collected.
-This avoids firing all HTTP requests simultaneously and getting rate-limited.
+This avoids rate-limiting from simultaneous requests.
 
 Returns list of {"text": str, "url": str, "title": str} dicts.
 Failures are caught and logged — callers always receive a (possibly empty) list.
@@ -34,17 +39,44 @@ logger = logging.getLogger(__name__)
 # Max characters per article sent to OpenRouter
 MAX_ARTICLE_CHARS = 10_000
 
-# How long to cache a Google News RSS query result (seconds)
+# If an RSS item's content:encoded text is at least this long, use it directly
+# instead of fetching the article page (avoids bot-blocking round-trips).
+MIN_RSS_FULL_TEXT_CHARS = 500
+
+# How long to cache RSS feeds and Google News results (seconds)
+RSS_CACHE_TTL        = 2 * 60 * 60  # 2 hours — refresh so new matches appear
 GOOGLE_NEWS_CACHE_TTL = 2 * 60 * 60  # 2 hours
 
-ESPNCRICINFO_RSS_URL = "https://www.espncricinfo.com/rss/content/story/feeds/0.xml"
-
-# Max Google News URLs to collect per query (avoids fetching 100 candidate URLs)
+# Max Google News URLs to collect per query
 GOOGLE_NEWS_MAX_URLS = 10
 
-# ESPNcricinfo article pages always return 403 — skip fetching them.
-# Only use ESPN RSS for keyword matching; let Cricbuzz / Google News supply text.
-_SKIP_FETCH_DOMAINS = {"espncricinfo.com"}
+# ── RSS feed URLs ──────────────────────────────────────────────────────────────
+ESPNCRICINFO_RSS_URL    = "https://www.espncricinfo.com/rss/content/story/feeds/0.xml"
+CRICBUZZ_RSS_URL        = "https://www.cricbuzz.com/cricket-news/rss-feed"
+CRICTRACKER_RSS_URL     = "https://www.crictracker.com/feed/"
+CRICKETADDICTOR_RSS_URL = "https://www.cricketaddictor.com/feed/"
+SPORTSKEEDA_RSS_URL     = "https://www.sportskeeda.com/cricket/feed"
+
+# Domains whose article pages block bots (403 or Cloudflare challenge) —
+# use RSS summary text only instead of attempting full page fetches.
+_NO_FETCH_DOMAINS = {"espncricinfo.com", "cricketaddictor.com"}
+
+# Known paywall / aggressive bot-blocking domains surfaced by Google News.
+# Skipped immediately without an HTTP attempt.
+_PAYWALL_DOMAINS = {
+    "thecricketer.com",
+    "wisden.com",
+    "theathletic.com",
+    "ft.com",
+    "bloomberg.com",
+    "wsj.com",
+    "nytimes.com",
+    "telegraph.co.uk",
+    "thetimes.co.uk",
+    "timesofindia.indiatimes.com",
+    "hindustantimes.com",
+    "ndtv.com",
+}
 
 # Words ignored when building keyword filter sets
 _STOPWORDS = {
@@ -71,6 +103,20 @@ def _keywords(query: str) -> set[str]:
     }
 
 
+def _domain(url: str) -> str:
+    """Extract hostname from a URL, e.g. 'www.cricbuzz.com'."""
+    try:
+        return url.split("/")[2]
+    except IndexError:
+        return ""
+
+
+def _is_no_fetch(url: str) -> bool:
+    """True if the URL's domain is in _NO_FETCH_DOMAINS."""
+    dom = _domain(url)
+    return any(d in dom for d in _NO_FETCH_DOMAINS)
+
+
 class ArticleFetcher:
     """Fetch full cricket article text for OpenRouter fact extraction."""
 
@@ -78,8 +124,9 @@ class ArticleFetcher:
         # Per-query Google News cache: {query: (fetched_at_epoch, [urls])}
         self._gnews_cache: dict[str, tuple[float, list[str]]] = {}
 
-        # Global RSS feed caches (fetched once per process lifetime)
-        self._espn_raw: list[dict] | None = None   # [{title, url, description}]
+        # RSS feed caches: {attr_name: (fetched_at_epoch, [items])}
+        # Keyed by the internal attribute name used in _rss_article_urls.
+        self._rss_cache: dict[str, tuple[float, list[dict]]] = {}
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
@@ -93,13 +140,14 @@ class ArticleFetcher:
         """
         Collect up to max_articles full-text articles about the match.
 
-        Sources:
-          - ESPNcricinfo: RSS title+description used directly as mini-articles
-            (article pages block bots with 403; RSS summaries are free data).
-          - Google News:  search RSS → follow redirect URLs to full article text.
-            Capped at GOOGLE_NEWS_MAX_URLS (10) candidates to avoid excessive fetching.
+        Source priority:
+          1. CricBuzz    — content:encoded (full article) → page fetch fallback
+          2. CricTracker — content:encoded → page fetch fallback
+          3. Sportskeeda — content:encoded → page fetch fallback
+          4. CricketAddictor — RSS description only (Cloudflare blocks pages)
+          5. ESPN RSS mini-articles (no page fetch — pages return 403)
+          6. Google News (fallback; paywall domains pre-filtered)
 
-        Article fetch is sequential with early exit to avoid rate limits.
         Returns list of {"text", "url", "title"}.
         """
         query = f"{home_team} vs {away_team}"
@@ -112,45 +160,195 @@ class ArticleFetcher:
             headers=HEADERS,
             follow_redirects=True,
         ) as client:
-            # ── Step 1: ESPN mini-articles from RSS descriptions (no page fetch) ─
-            espn_articles = await self._espn_rss_articles(client, kw)
-            logger.info(
-                "ArticleFetcher: ESPN RSS mini-articles for '%s': %d", query, len(espn_articles)
+            articles: list[dict] = []
+
+            # ── 1. CricBuzz full article pages ─────────────────────────────────
+            cb_items = await self._rss_items_for_query(
+                client, CRICBUZZ_RSS_URL, "_cricbuzz_raw", kw, "CricBuzz"
             )
-
-            # ── Step 2: collect fetchable URLs from Google News (capped at 10) ──
-            gnews_urls = await self._google_news_urls(client, query)
-
-            logger.info(
-                "ArticleFetcher: fetchable URL candidates for '%s' — Google News: %d",
-                query, len(gnews_urls),
-            )
-
-            # Deduplicate URLs
-            seen: set[str] = set()
-            all_urls: list[str] = []
-            for url in gnews_urls:
-                if url not in seen:
-                    seen.add(url)
-                    all_urls.append(url)
-
-            # ── Step 3: fetch full text sequentially, stop when we have enough ─
-            # Start with ESPN mini-articles, then fill up with fetched articles.
-            articles: list[dict] = list(espn_articles)
-            for url in all_urls:
+            logger.info("ArticleFetcher: CricBuzz candidates for '%s': %d", query, len(cb_items))
+            for item in cb_items:
                 if len(articles) >= max_articles:
                     break
-                if any(domain in url for domain in _SKIP_FETCH_DOMAINS):
-                    logger.debug("ArticleFetcher: skipping fetch for %s (blocked domain)", url)
-                    continue
-                article = await self._fetch_article_text(client, url)
-                if article:
-                    articles.append(article)
+                if item.get("rss_full_text"):
+                    # content:encoded had full text — no page fetch needed
+                    logger.info("ArticleFetcher: using RSS full text for %s", item["url"])
+                    articles.append({
+                        "text":  item["description"][:MAX_ARTICLE_CHARS],
+                        "url":   item["url"],
+                        "title": item["title"],
+                    })
+                else:
+                    article = await self._fetch_article_text(client, item["url"])
+                    if article:
+                        articles.append(article)
+                    else:
+                        logger.info("ArticleFetcher: no usable text from %s", item["url"])
 
-        logger.info(
-            "ArticleFetcher: returning %d articles for '%s'",
-            len(articles), query,
-        )
+            # ── 2. CricTracker full article pages ──────────────────────────────
+            ct_items = await self._rss_items_for_query(
+                client, CRICTRACKER_RSS_URL, "_crictracker_raw", kw, "CricTracker"
+            )
+            logger.info("ArticleFetcher: CricTracker candidates for '%s': %d", query, len(ct_items))
+            for item in ct_items:
+                if len(articles) >= max_articles:
+                    break
+                if item.get("rss_full_text"):
+                    logger.info("ArticleFetcher: using RSS full text for %s", item["url"])
+                    articles.append({
+                        "text":  item["description"][:MAX_ARTICLE_CHARS],
+                        "url":   item["url"],
+                        "title": item["title"],
+                    })
+                else:
+                    article = await self._fetch_article_text(client, item["url"])
+                    if article:
+                        articles.append(article)
+                    else:
+                        logger.info("ArticleFetcher: no usable text from %s", item["url"])
+
+            # ── 3. Sportskeeda full article pages (good IPL/T20 coverage) ─────────
+            if len(articles) < max_articles:
+                sk_items = await self._rss_items_for_query(
+                    client, SPORTSKEEDA_RSS_URL, "_sportskeeda_raw", kw, "Sportskeeda"
+                )
+                logger.info("ArticleFetcher: Sportskeeda candidates for '%s': %d", query, len(sk_items))
+                for item in sk_items:
+                    if len(articles) >= max_articles:
+                        break
+                    if item.get("rss_full_text"):
+                        logger.info("ArticleFetcher: using RSS full text for %s", item["url"])
+                        articles.append({
+                            "text":  item["description"][:MAX_ARTICLE_CHARS],
+                            "url":   item["url"],
+                            "title": item["title"],
+                        })
+                    else:
+                        article = await self._fetch_article_text(client, item["url"])
+                        if article:
+                            articles.append(article)
+                        else:
+                            logger.info("ArticleFetcher: no usable text from %s", item["url"])
+
+            # ── 5. CricketAddictor — RSS description only (Cloudflare blocks pages)
+            if len(articles) < max_articles:
+                ca_items = await self._rss_items_for_query(
+                    client, CRICKETADDICTOR_RSS_URL, "_cricketaddictor_raw", kw, "CricketAddictor"
+                )
+                logger.info(
+                    "ArticleFetcher: CricketAddictor RSS descriptions for '%s': %d",
+                    query, len(ca_items),
+                )
+                for item in ca_items:
+                    if len(articles) >= max_articles:
+                        break
+                    text = f"{item['title']}\n\n{item.get('description', '')}".strip()
+                    if text:
+                        articles.append({
+                            "text":  text[:MAX_ARTICLE_CHARS],
+                            "url":   item["url"],
+                            "title": item["title"],
+                        })
+
+            # ── 6. ESPN RSS mini-articles (no page fetch) ───────────────────────
+            if len(articles) < max_articles:
+                espn_articles = await self._espn_rss_articles(client, kw)
+                logger.info(
+                    "ArticleFetcher: ESPN RSS mini-articles for '%s': %d",
+                    query, len(espn_articles),
+                )
+                for art in espn_articles:
+                    if len(articles) >= max_articles:
+                        break
+                    articles.append(art)
+
+            # ── 7. Google News fallback ─────────────────────────────────────────
+            if len(articles) < max_articles:
+                gnews_urls = await self._google_news_urls(client, query)
+                logger.info(
+                    "ArticleFetcher: Google News candidates for '%s': %d",
+                    query, len(gnews_urls),
+                )
+                for url in gnews_urls:
+                    if len(articles) >= max_articles:
+                        break
+                    dom = _domain(url)
+                    if any(d in dom for d in _NO_FETCH_DOMAINS | _PAYWALL_DOMAINS):
+                        logger.info("ArticleFetcher: skipping %s (blocked/paywall domain)", url)
+                        continue
+                    article = await self._fetch_article_text(client, url)
+                    if article:
+                        articles.append(article)
+                    else:
+                        logger.info("ArticleFetcher: no usable text from %s", url)
+
+        logger.info("ArticleFetcher: returning %d articles for '%s'", len(articles), query)
+        return articles
+
+    # ── RSS feed helpers ───────────────────────────────────────────────────────
+
+    async def _rss_items_for_query(
+        self,
+        client: httpx.AsyncClient,
+        feed_url: str,
+        cache_key: str,
+        keywords: set[str],
+        label: str,
+    ) -> list[dict]:
+        """
+        Fetch an RSS feed (with 2h TTL cache), filter items by keywords, and
+        return matching items as dicts with {url, title, description}.
+        """
+        cached = self._rss_cache.get(cache_key)
+        now = time.time()
+        if cached is None or (now - cached[0]) > RSS_CACHE_TTL:
+            items = await self._fetch_rss_items(client, feed_url)
+            self._rss_cache[cache_key] = (now, items)
+            logger.info("ArticleFetcher: %s RSS refreshed — %d items cached", label, len(items))
+        else:
+            items = cached[1]
+            age_min = int((now - cached[0]) / 60)
+            logger.debug("ArticleFetcher: %s RSS cache hit (age=%dm, %d items)", label, age_min, len(items))
+
+        matched = [
+            item for item in items
+            if any(kw in (item["title"] + " " + item.get("description", "")).lower() for kw in keywords)
+            and item.get("url")
+        ]
+        # Tag items that have enough RSS content to skip a page fetch entirely.
+        for item in matched:
+            item["rss_full_text"] = len(item.get("description", "")) >= MIN_RSS_FULL_TEXT_CHARS
+        return matched
+
+    async def _espn_rss_articles(
+        self,
+        client: httpx.AsyncClient,
+        keywords: set[str],
+    ) -> list[dict]:
+        """
+        Return ESPNcricinfo RSS items matching any keyword as mini-articles.
+        Uses RSS title+description as text — no page fetch (pages return 403).
+        """
+        cached = self._rss_cache.get("_espn_raw")
+        now = time.time()
+        if cached is None or (now - cached[0]) > RSS_CACHE_TTL:
+            items = await self._fetch_rss_items(client, ESPNCRICINFO_RSS_URL)
+            self._rss_cache["_espn_raw"] = (now, items)
+            logger.info("ArticleFetcher: ESPNcricinfo RSS refreshed — %d items cached", len(items))
+        else:
+            items = cached[1]
+
+        articles: list[dict] = []
+        for item in items:
+            combined = (item["title"] + " " + item.get("description", "")).lower()
+            if any(kw in combined for kw in keywords):
+                text = f"{item['title']}\n\n{item.get('description', '')}".strip()
+                if text:
+                    articles.append({
+                        "text":  text,
+                        "url":   item["url"],
+                        "title": item["title"],
+                    })
         return articles
 
     # ── Google News RSS (per-query, 2h cache) ─────────────────────────────────
@@ -162,11 +360,6 @@ class ArticleFetcher:
     ) -> list[str]:
         """
         Return article URLs from Google News RSS, using a 2h in-memory cache.
-
-        Google News RSS uses <link/> as a self-closing empty element — the actual
-        article URL is inside the <description> field as an <a href="..."> pointing
-        to a news.google.com/rss/articles/CBMi... redirect URL.  We extract those
-        href values; httpx follows the 302 redirect to the real article at fetch time.
         """
         cached = self._gnews_cache.get(query)
         if cached:
@@ -186,8 +379,6 @@ class ArticleFetcher:
 
             urls: list[str] = []
             for item in re.findall(r"<item>(.*?)</item>", resp.text, re.DOTALL):
-                # Primary: extract href from <description><a href="..."> — these are
-                # news.google.com redirect URLs that 302 to the actual article page.
                 desc_m = re.search(r"<description>(.*?)</description>", item, re.DOTALL)
                 if desc_m:
                     href_m = re.search(
@@ -197,8 +388,6 @@ class ArticleFetcher:
                     if href_m:
                         urls.append(href_m.group(1))
                         continue
-
-                # Fallback: some RSS flavours do put the URL in <link>
                 link_m = re.search(r"<link>(https?://[^<]+)</link>", item)
                 if link_m:
                     urls.append(link_m.group(1).strip())
@@ -214,44 +403,20 @@ class ArticleFetcher:
             logger.warning("ArticleFetcher: Google News RSS failed for '%s': %s", query, exc)
             return []
 
-    # ── ESPNcricinfo RSS → mini-articles (no page fetch) ──────────────────────
-
-    async def _espn_rss_articles(
-        self,
-        client: httpx.AsyncClient,
-        keywords: set[str],
-    ) -> list[dict]:
-        """
-        Return ESPNcricinfo RSS items matching any keyword as mini-articles.
-        Uses the RSS title + description as the article text — no page fetch.
-        This avoids the 403 on ESPN article pages while still getting editorial
-        content (toss results, squad news, pitch reports often appear in summaries).
-        """
-        if self._espn_raw is None:
-            self._espn_raw = await self._fetch_rss_items(client, ESPNCRICINFO_RSS_URL)
-            logger.info(
-                "ArticleFetcher: ESPNcricinfo RSS cached %d items", len(self._espn_raw)
-            )
-
-        articles: list[dict] = []
-        for item in self._espn_raw:
-            combined = (item["title"] + " " + item.get("description", "")).lower()
-            if any(kw in combined for kw in keywords):
-                text = f"{item['title']}\n\n{item.get('description', '')}".strip()
-                if text:
-                    articles.append({
-                        "text":  text,
-                        "url":   item["url"],
-                        "title": item["title"],
-                    })
-        return articles
+    # ── Shared RSS item parser ─────────────────────────────────────────────────
 
     async def _fetch_rss_items(
         self,
         client: httpx.AsyncClient,
         feed_url: str,
     ) -> list[dict]:
-        """Fetch an RSS feed and return [{title, url, description}] for all items."""
+        """Fetch an RSS feed and return [{title, url, description}] for all items.
+
+        Parses both <description> and <content:encoded> — the latter is where
+        most feeds (CricBuzz, Sportskeeda, etc.) put the full article HTML.
+        When full content is present it is used as the description so callers
+        get long-form text without needing a separate page fetch.
+        """
         try:
             resp = await client.get(feed_url)
             resp.raise_for_status()
@@ -261,13 +426,34 @@ class ArticleFetcher:
 
         items: list[dict] = []
         for item in re.findall(r"<item>(.*?)</item>", resp.text, re.DOTALL):
-            title_m = re.search(r"<title>(.*?)</title>",       item, re.DOTALL)
+            title_m = re.search(r"<title>(.*?)</title>",          item, re.DOTALL)
             link_m  = re.search(r"<link>(https?://[^<]+)</link>", item)
             desc_m  = re.search(r"<description>(.*?)</description>", item, re.DOTALL)
 
+            # content:encoded holds the full article HTML in many feeds.
+            # It's wrapped in CDATA so we strip the markers and then all HTML tags.
+            content_m = re.search(
+                r"<content:encoded>(.*?)</content:encoded>", item, re.DOTALL
+            )
+
             title = re.sub(r"<[^>]+>", "", title_m.group(1)).strip() if title_m else ""
             url   = link_m.group(1).strip() if link_m else ""
-            desc  = re.sub(r"<[^>]+>", "", desc_m.group(1)).strip() if desc_m else ""
+
+            if content_m:
+                raw = content_m.group(1).strip()
+                # Strip CDATA wrapper if present
+                raw = re.sub(r"^<!\[CDATA\[", "", raw)
+                raw = re.sub(r"\]\]>$", "", raw)
+                desc = re.sub(r"<[^>]+>", " ", raw)
+                desc = re.sub(r"\s+", " ", desc).strip()
+            elif desc_m:
+                raw = desc_m.group(1).strip()
+                raw = re.sub(r"^<!\[CDATA\[", "", raw)
+                raw = re.sub(r"\]\]>$", "", raw)
+                desc = re.sub(r"<[^>]+>", " ", raw)
+                desc = re.sub(r"\s+", " ", desc).strip()
+            else:
+                desc = ""
 
             if url:
                 items.append({"title": title, "url": url, "description": desc})
@@ -282,53 +468,66 @@ class ArticleFetcher:
     ) -> Optional[dict]:
         """
         Fetch a single article URL and extract its main text body.
+
+        Uses trafilatura as the primary extractor — it handles diverse site
+        layouts, strips boilerplate/nav/ads, and outperforms manual CSS selectors
+        across cricket news sites. Falls back to BeautifulSoup <p> extraction
+        if trafilatura returns nothing.
+
         Returns None if the page is unreachable or yields too little text.
         """
         try:
-            from bs4 import BeautifulSoup
-        except ImportError:
-            logger.warning("ArticleFetcher: beautifulsoup4 not installed")
-            return None
-
-        try:
             resp = await client.get(url, timeout=10.0)
             if resp.status_code != 200:
-                logger.debug("ArticleFetcher: %s → HTTP %d", url, resp.status_code)
+                logger.info("ArticleFetcher: %s → HTTP %d (skipping)", url, resp.status_code)
                 return None
 
-            soup = BeautifulSoup(resp.text, "lxml")
+            html = resp.text
+            text: str = ""
 
-            for tag in soup(["script", "style", "nav", "header", "footer",
-                              "aside", "form", "noscript", "iframe"]):
-                tag.decompose()
+            # ── Primary: trafilatura ───────────────────────────────────────────
+            try:
+                import trafilatura
+                extracted = trafilatura.extract(
+                    html,
+                    include_comments=False,
+                    include_tables=False,
+                    no_fallback=False,
+                    favor_recall=True,    # prefer more text over precision
+                )
+                if extracted:
+                    text = extracted.strip()
+            except ImportError:
+                logger.debug("ArticleFetcher: trafilatura not installed, using BeautifulSoup")
+            except Exception as exc:
+                logger.debug("ArticleFetcher: trafilatura failed for %s: %s", url, exc)
 
-            body = (
-                soup.select_one("article")
-                or soup.select_one("[class*='article-body']")
-                or soup.select_one("[class*='story-body']")
-                or soup.select_one("[class*='post-content']")
-                or soup.select_one("[class*='entry-content']")
-                or soup.select_one("main")
-            )
-
-            if body:
-                text = body.get_text(separator="\n", strip=True)
-            else:
-                paras = [
-                    p.get_text(strip=True)
-                    for p in soup.find_all("p")
-                    if len(p.get_text(strip=True)) > 60
-                ]
-                text = "\n".join(paras)
+            # ── Fallback: BeautifulSoup <p> extraction ─────────────────────────
+            if len(text) < 200:
+                try:
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(html, "lxml")
+                    for tag in soup(["script", "style", "nav", "header", "footer",
+                                     "aside", "form", "noscript", "iframe"]):
+                        tag.decompose()
+                    paras = [
+                        p.get_text(strip=True)
+                        for p in soup.find_all("p")
+                        if len(p.get_text(strip=True)) > 60
+                    ]
+                    bs_text = "\n".join(paras)
+                    if len(bs_text) > len(text):
+                        text = bs_text
+                except Exception as exc:
+                    logger.debug("ArticleFetcher: BeautifulSoup fallback failed for %s: %s", url, exc)
 
             if len(text) < 200:
-                logger.debug(
-                    "ArticleFetcher: %s too short (%d chars), skipping", url, len(text)
-                )
+                logger.debug("ArticleFetcher: %s too short (%d chars), skipping", url, len(text))
                 return None
 
-            h1    = soup.select_one("h1")
-            title = h1.get_text(strip=True) if h1 else url.split("/")[-1]
+            # Best-effort title from the URL slug
+            slug = url.rstrip("/").split("/")[-1]
+            title = slug.replace("-", " ").replace("_", " ").title()
 
             logger.info("ArticleFetcher: fetched %d chars from %s", len(text), url)
             return {

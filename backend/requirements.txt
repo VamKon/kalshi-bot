@@ -12,3 +12,4 @@ cryptography==43.0.1
 
 beautifulsoup4==4.12.3
 lxml==5.2.2
+trafilatura==1.12.2

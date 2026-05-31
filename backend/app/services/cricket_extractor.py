@@ -140,6 +140,21 @@ class CricketExtractor:
         if not self._enabled:
             return CricketFacts()
 
+        if not article_text or not article_text.strip():
+            logger.debug("CricketExtractor: skipping empty article for %s", source_url)
+            return CricketFacts()
+
+        # RSS mini-articles (headline + 1-2 sentences) don't contain extractable
+        # facts — skip them to avoid wasting OpenRouter tokens and getting empty
+        # JSON back (which causes "Expecting value: line 1 column 1 (char 0)").
+        MIN_EXTRACTABLE_CHARS = 300
+        if len(article_text.strip()) < MIN_EXTRACTABLE_CHARS:
+            logger.debug(
+                "CricketExtractor: skipping short text (%d chars) for %s",
+                len(article_text.strip()), source_url,
+            )
+            return CricketFacts()
+
         context = f"Match: {home_team} vs {away_team}"
         if competition:
             context += f" ({competition})"
@@ -164,7 +179,17 @@ class CricketExtractor:
                         "max_tokens": 2000,
                     },
                 )
-                response.raise_for_status()
+                if not response.is_success:
+                    # Log the OpenRouter error body so model/auth issues are obvious
+                    # (previously raise_for_status() only showed the article URL, not
+                    # the real cause — e.g. "model not found" or "invalid api key")
+                    logger.warning(
+                        "CricketExtractor: OpenRouter HTTP %d (model=%s) — %s",
+                        response.status_code,
+                        settings.OPENROUTER_MODEL,
+                        response.text[:400],
+                    )
+                    return CricketFacts()
                 data = response.json()
 
             content = data["choices"][0]["message"]["content"]
@@ -178,7 +203,12 @@ class CricketExtractor:
             if content.endswith("```"):
                 content = content[:-3]
 
-            parsed = json.loads(content.strip())
+            content = content.strip()
+            if not content:
+                logger.debug("CricketExtractor: empty response from OpenRouter for %s", source_url)
+                return CricketFacts()
+
+            parsed = json.loads(content)
             facts = CricketFacts(**{k: v for k, v in parsed.items() if k in CricketFacts.model_fields})
             if source_url:
                 facts.source_urls = [source_url]

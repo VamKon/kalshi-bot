@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     # Used for cost-effective cricket fact extraction via Llama 3 70B.
     # Falls back gracefully (no facts injected) when key is not set.
     OPENROUTER_API_KEY: Optional[str] = None
-    OPENROUTER_MODEL: str = "meta-llama/llama-3-70b-instruct"
+    OPENROUTER_MODEL: str = "meta-llama/llama-3.1-8b-instruct"
 
     # ── Trading parameters ────────────────────────────────────────────────
     # Set PAPER_TRADING=false + KALSHI_API_BASE_URL=production URL to go live.

@@ -149,9 +149,10 @@ CRICKET ANALYSIS RULES:
 
 # Injected into SONNET_USER_PROMPT when sportsbook odds are available
 ODDS_SECTION_TEMPLATE = """\
-SPORTSBOOK CONSENSUS:
-- Consensus probability: {consensus_prob:.1%}
-- Bookmaker range: {min_prob:.1%} - {max_prob:.1%}
+SPORTSBOOK CONSENSUS (all figures below are for the YES outcome — P(YES wins)):
+- Consensus P(YES wins): {consensus_prob:.1%}   →   P(NO wins): {no_prob:.1%}
+- Bookmaker range for YES: {min_prob:.1%} - {max_prob:.1%}
+- Pre-computed edges: Edge_YES = {edge_yes:+.1%}  |  Edge_NO = {edge_no:+.1%}
 - Line movement: {movement}
 - Bookmakers ({count}): {bookmaker_summary}
 Your role: does the sportsbook consensus make sense given the headlines/injuries,
@@ -378,14 +379,27 @@ class AIService:
         odds_section = ""
         if odds_context and odds_context.get("consensus_prob") is not None:
             bm_details = odds_context.get("bookmakers", [])
+            yes_is_home = odds_context.get("yes_is_home", True)
+            # Show YES-side probability per bookmaker, not always home_prob.
+            # When YES=away (yes_is_home=False), home_prob is the NO team — showing
+            # it caused the AI to see a contradiction (home=44.5% vs consensus=55.5%)
+            # and incorrectly label the consensus as the NO side.
             bm_summary = ", ".join(
-                f"{b['bookmaker']}:{b.get('home_prob', 0):.1%}"
-                for b in bm_details[:6]   # cap at 6 to stay within token budget
+                f"{b['bookmaker']}:"
+                f"{(b.get('home_prob', 0) if yes_is_home else b.get('away_prob', 1 - b.get('home_prob', 0.5))):.1%}"
+                for b in bm_details[:6]
             ) or "N/A"
+            cp       = odds_context["consensus_prob"]   # always P(YES wins)
+            no_prob  = round(1 - cp, 4)
+            edge_yes = round(cp - yes_ask, 4)
+            edge_no  = round(no_prob - (1 - yes_ask), 4)
             odds_section = ODDS_SECTION_TEMPLATE.format(
-                consensus_prob=odds_context["consensus_prob"],
-                min_prob=odds_context.get("min_prob", odds_context["consensus_prob"]),
-                max_prob=odds_context.get("max_prob", odds_context["consensus_prob"]),
+                consensus_prob=cp,
+                no_prob=no_prob,
+                min_prob=odds_context.get("min_prob", cp),
+                max_prob=odds_context.get("max_prob", cp),
+                edge_yes=edge_yes,
+                edge_no=edge_no,
                 movement=odds_context.get("movement", "No prior reading"),
                 count=odds_context.get("bookmaker_count", len(bm_details)),
                 bookmaker_summary=bm_summary,

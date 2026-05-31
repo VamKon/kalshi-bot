@@ -125,6 +125,54 @@ TEAM_ALIASES: dict[str, str] = {
     "adl":  "adelaide strikers",
     "hob":  "hobart hurricanes",
     "per":  "perth scorchers",
+    # T20 Internationals — Kalshi ticker abbreviation → Odds API country name.
+    # These are REQUIRED so the ticker-suffix primary lookup in match_market()
+    # resolves yes_is_home correctly instead of falling through to the
+    # unreliable title-scoring fallback (which ties → yes_is_home=True by
+    # default, causing inverted YES/NO assignment and wrong-sided trades).
+    "ind":  "india",
+    "eng":  "england",
+    "aus":  "australia",
+    "pak":  "pakistan",
+    "sa":   "south africa",
+    "wi":   "west indies",
+    "ban":  "bangladesh",
+    "sl":   "sri lanka",
+    "nz":   "new zealand",
+    "zim":  "zimbabwe",
+    "ire":  "ireland",
+    "afg":  "afghanistan",
+    "sco":  "scotland",
+    "nam":  "namibia",
+    "uae":  "united arab emirates",
+    "nep":  "nepal",
+    "png":  "papua new guinea",
+    "oma":  "oman",
+    "usa":  "united states",
+    "can":  "canada",
+    "hkg":  "hong kong",
+    # T20 Internationals — full → short (reverse lookups)
+    "india":                    "ind",
+    "england":                  "eng",
+    "australia":                "aus",
+    "pakistan":                 "pak",
+    "south africa":             "sa",
+    "west indies":              "wi",
+    "bangladesh":               "ban",
+    "sri lanka":                "sl",
+    "new zealand":              "nz",
+    "zimbabwe":                 "zim",
+    "ireland":                  "ire",
+    "afghanistan":              "afg",
+    "scotland":                 "sco",
+    "namibia":                  "nam",
+    "united arab emirates":     "uae",
+    "nepal":                    "nep",
+    "papua new guinea":         "png",
+    "oman":                     "oma",
+    "united states":            "usa",
+    "canada":                   "can",
+    "hong kong":                "hkg",
 }
 
 # ── Venue map ──────────────────────────────────────────────────────────────────
@@ -247,14 +295,18 @@ def _alias_tokens(team_norm: str) -> set[str]:
 
 def _teams_overlap(kalshi_title: str, event_home: str, event_away: str) -> bool:
     """
-    Return True if the Kalshi market title appears to reference the same game.
+    Return True if the Kalshi market title references at least one team in the event.
+
+    This is a coarse first-pass filter; `match_market` applies a stricter
+    ticker-suffix constraint afterwards to eliminate wrong-event matches when
+    multiple cached events share one team name.
 
     Uses alias-aware token overlap so IPL abbreviations in Kalshi titles
     (e.g. "SRH", "MI", "RCB") correctly match Odds API full team names
     (e.g. "Sunrisers Hyderabad", "Mumbai Indians").
 
-    Uses exact word matching only (t in title_words) — never substring matching —
-    to prevent short tokens like "mi" matching inside words like "semi" or "limit".
+    Uses exact word matching only — never substring matching — to prevent short
+    tokens like "mi" matching inside words like "semi" or "limit".
     """
     title_words = set(_normalize_team(kalshi_title).split())
     for team_name in (event_home, event_away):
@@ -402,13 +454,22 @@ class OddsService:
             "max_home_prob":    max(d["home_prob"] for d in bookmaker_details),
         }
 
-    async def _load_cached(self, db: AsyncSession, sport: str) -> list[dict]:
+    async def _load_cached(
+        self,
+        db: AsyncSession,
+        sport: str,
+        *,
+        ignore_ttl: bool = False,
+    ) -> list[dict]:
         """
-        Return one deduplicated event dict per event_key for a sport, using
-        cached rows within the TTL window.  Reconstructs both home_team,
-        away_team, consensus_home, and consensus_away from stored rows so
-        match_market has everything it needs.
-        Returns an empty list if cache is stale or missing.
+        Return one deduplicated event dict per event_key for a sport.
+
+        By default only rows within the 6-hour TTL window are used.
+        Pass ignore_ttl=True to return all cached rows regardless of age
+        (used as a last-resort fallback when a live fetch fails).
+
+        Returns an empty list when no rows exist (or all are stale and
+        ignore_ttl is False).
         """
         now = datetime.now(timezone.utc)
         cutoff = now.timestamp() - ODDS_CACHE_TTL
@@ -421,7 +482,7 @@ class OddsService:
         )
         rows = result.scalars().all()
 
-        fresh = [
+        fresh = rows if ignore_ttl else [
             r for r in rows
             if r.fetched_at and r.fetched_at.timestamp() > cutoff
         ]
@@ -499,20 +560,29 @@ class OddsService:
     async def fetch_and_cache(self, db: AsyncSession, sport: str) -> list[dict]:
         """
         Fetch odds for a sport across all mapped sport keys, persist to DB,
-        and return parsed events. Uses cached data if still within TTL.
+        and return parsed events.
+
+        Resolution order:
+        1. Fresh cache (within 6-hour TTL) — no API call needed.
+        2. Live fetch from The Odds API — updates cache, returns new events.
+        3. Stale cache fallback — when live fetch returns nothing (API error,
+           rate limit, sport not active), use the most recent cached data
+           regardless of age.  Logs a warning so the staleness is visible.
+        4. Empty list — no data at all; if REQUIRE_SPORTSBOOK_ODDS is True
+           the scanner will skip the market rather than trading on AI alone.
         """
         sport_keys = SPORT_KEY_MAP.get(sport)
         if not sport_keys:
             logger.debug("No Odds API mapping for sport '%s'", sport)
             return []
 
-        # Try cache first
+        # 1. Fresh cache
         cached = await self._load_cached(db, sport)
         if cached:
-            logger.info("OddsService [%s]: using cached odds (%d rows)", sport, len(cached))
+            logger.info("OddsService [%s]: using cached odds (%d events)", sport, len(cached))
             return cached
 
-        # Cache miss — fetch live across all keys for this sport
+        # 2. Live fetch
         parsed_events: list[dict] = []
         for sport_key in sport_keys:
             raw_events = await self._fetch_odds(sport_key)
@@ -522,11 +592,30 @@ class OddsService:
                     await self._save_to_cache(db, sport, parsed["event_key"], parsed)
                     parsed_events.append(parsed)
 
-        logger.info(
-            "OddsService [%s]: fetched & cached %d usable events across %d keys",
-            sport, len(parsed_events), len(sport_keys)
+        if parsed_events:
+            logger.info(
+                "OddsService [%s]: fetched & cached %d usable events across %d keys",
+                sport, len(parsed_events), len(sport_keys),
+            )
+            return parsed_events
+
+        # 3. Stale fallback — live fetch returned nothing
+        stale = await self._load_cached(db, sport, ignore_ttl=True)
+        if stale:
+            logger.warning(
+                "OddsService [%s]: live fetch returned no events — falling back to "
+                "stale cache (%d events). Consensus probabilities may be outdated.",
+                sport, len(stale),
+            )
+            return stale
+
+        # 4. Truly no data
+        logger.warning(
+            "OddsService [%s]: no sportsbook data available (live fetch empty, "
+            "cache empty). Markets will be skipped if REQUIRE_SPORTSBOOK_ODDS=True.",
+            sport,
         )
-        return parsed_events
+        return []
 
     def match_market(
         self,
@@ -586,6 +675,23 @@ class OddsService:
             yes_team_abbrev = _normalize_team(ticker_parts[-1]) if len(ticker_parts) == 2 else ""
             home_tokens = _alias_tokens(_normalize_team(home))
             away_tokens = _alias_tokens(_normalize_team(away))
+
+            # ── YES-team guard ──────────────────────────────────────────────
+            # When the ticker suffix resolves to a known team abbreviation,
+            # that team MUST be one of the two teams in this Odds API event.
+            # Without this check, a cached "LSG vs GT" event could match a
+            # "Will RCB beat LSG?" market (via _teams_overlap on "lsg"), and
+            # the wrong team's consensus probability would be used for edge
+            # calculation — the root cause of the phantom-edge trades.
+            if yes_team_abbrev and \
+               yes_team_abbrev not in home_tokens and \
+               yes_team_abbrev not in away_tokens:
+                logger.debug(
+                    "  skipping event (home='%s', away='%s'): YES team '%s' "
+                    "not present — wrong event",
+                    home, away, yes_team_abbrev,
+                )
+                continue
 
             if yes_team_abbrev and yes_team_abbrev in home_tokens:
                 yes_is_home = True

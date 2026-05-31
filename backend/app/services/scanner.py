@@ -398,10 +398,18 @@ class MarketScanner:
                 select(Trade.market_id).where(Trade.status == "open")
             )
             open_market_ids: set[str] = {row[0] for row in result.fetchall()}
+            # Derive event-level tickers from open market IDs.
+            # Kalshi market tickers follow the pattern {event_ticker}-{outcome}
+            # (e.g. KXPSLGAME-26APR13MUSPZA-MUS → KXPSLGAME-26APR13MUSPZA).
+            # Blocking at the event level prevents the scanner from taking the
+            # opposite side of the same game in a later scan cycle.
+            open_event_tickers: set[str] = {
+                mid.rsplit("-", 1)[0] for mid in open_market_ids if "-" in mid
+            }
             if open_market_ids:
                 logger.info(
-                    "Open positions: %d markets — will skip if re-encountered: %s",
-                    len(open_market_ids), open_market_ids,
+                    "Open positions: %d markets / %d events — will skip if re-encountered: %s",
+                    len(open_market_ids), len(open_event_tickers), open_market_ids,
                 )
 
             # Bulk-load the most recent yes_ask per market from market_signals
@@ -447,10 +455,11 @@ class MarketScanner:
 
             for market, sport in deduped:
                 ticker = market.get("ticker", "")
-                if ticker in open_market_ids:
+                event_ticker = market.get("event_ticker") or ticker.rsplit("-", 1)[0]
+                if ticker in open_market_ids or event_ticker in open_event_tickers:
                     logger.info(
-                        "Skipping %s — open position already exists on this market",
-                        ticker,
+                        "Skipping %s — open position already exists on this game (%s)",
+                        ticker, event_ticker,
                     )
                     continue
                 markets_scanned += 1
@@ -613,13 +622,29 @@ class MarketScanner:
                 commence_dt_str = market.get("expected_expiration_time") or market.get("close_time") or ""
 
             if home_team and away_team and event_key:
-                cricket_facts = await cricket_facts_cache.get(db, event_key)
-                if cricket_facts is None:
+                cached = await cricket_facts_cache.get(db, event_key)
+
+                # Treat confidence=0.0 cache entries as misses — these are artefacts
+                # of a previously failed extraction (e.g. a broken model returning 404)
+                # that was incorrectly stored. Always retry so the working model runs.
+                if cached is not None and cached.extraction_confidence > 0.0:
+                    cricket_facts = cached
                     logger.info(
-                        "CricketFacts cache miss for %s — fetching articles (%s vs %s)%s",
-                        event_key, home_team, away_team,
-                        " [no sportsbook match]" if not odds_context else "",
+                        "CricketFacts cache hit for %s (confidence=%.2f, toss=%s)",
+                        event_key, cricket_facts.extraction_confidence, cricket_facts.toss_winner,
                     )
+                else:
+                    if cached is not None:
+                        logger.info(
+                            "CricketFacts cache hit discarded for %s — confidence=0.0 (stale failed extraction), retrying",
+                            event_key,
+                        )
+                    else:
+                        logger.info(
+                            "CricketFacts cache miss for %s — fetching articles (%s vs %s)%s",
+                            event_key, home_team, away_team,
+                            " [no sportsbook match]" if not odds_context else "",
+                        )
                     articles = await article_fetcher.fetch_match_articles(
                         home_team, away_team, competition, max_articles=10
                     )
@@ -627,22 +652,25 @@ class MarketScanner:
                         cricket_facts = await cricket_extractor.extract_from_multiple(
                             articles, home_team, away_team, match_format, competition
                         )
-                        # Parse commence_time for TTL calculation
-                        try:
-                            from datetime import datetime as _dt
-                            commence_dt = _dt.fromisoformat(
-                                commence_dt_str.replace("Z", "+00:00")
-                            ) if commence_dt_str else None
-                        except Exception:
-                            commence_dt = None
-                        await cricket_facts_cache.set(db, event_key, cricket_facts, commence_dt)
+                        # Only cache when extraction produced meaningful facts.
+                        # confidence=0.0 means OpenRouter returned nothing useful —
+                        # don't persist it or it will block retries until TTL expires.
+                        if cricket_facts and cricket_facts.extraction_confidence > 0.0:
+                            try:
+                                from datetime import datetime as _dt
+                                commence_dt = _dt.fromisoformat(
+                                    commence_dt_str.replace("Z", "+00:00")
+                                ) if commence_dt_str else None
+                            except Exception:
+                                commence_dt = None
+                            await cricket_facts_cache.set(db, event_key, cricket_facts, commence_dt)
+                        else:
+                            logger.info(
+                                "CricketFacts extraction returned confidence=0.0 for %s — not caching, will retry next scan",
+                                event_key,
+                            )
                     else:
                         logger.info("No articles found for %s vs %s — proceeding without facts", home_team, away_team)
-                else:
-                    logger.info(
-                        "CricketFacts cache hit for %s (confidence=%.2f, toss=%s)",
-                        event_key, cricket_facts.extraction_confidence, cricket_facts.toss_winner,
-                    )
             else:
                 logger.info(
                     "CricketFacts skipped for %s — could not determine team names from title '%s'",
@@ -787,12 +815,17 @@ class MarketScanner:
                 select(Trade.market_id).where(Trade.status == "open")
             )
             open_market_ids: set[str] = {row[0] for row in result.fetchall()}
+            open_event_tickers: set[str] = {
+                mid.rsplit("-", 1)[0] for mid in open_market_ids if "-" in mid
+            }
 
             for market in markets:
                 ticker = market.get("ticker", "")
-                if ticker in open_market_ids:
+                event_ticker = market.get("event_ticker") or ticker.rsplit("-", 1)[0]
+                if ticker in open_market_ids or event_ticker in open_event_tickers:
                     logger.info(
-                        "TossWatcher: skipping %s — open position exists", ticker
+                        "TossWatcher: skipping %s — open position exists on this game (%s)",
+                        ticker, event_ticker,
                     )
                     continue
 
